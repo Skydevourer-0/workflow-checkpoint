@@ -189,28 +189,12 @@ def cmd_pause(wf_dir, args):
     if prog is None:
         print(f"Task '{slug}' not found.", file=sys.stderr); sys.exit(1)
     if prog["event"] == "paused":
-        if not getattr(args, "force", False):
-            print(
-                f"Task '{slug}' is already paused. "
-                "Use 'resume' to activate, work, then 'pause' to checkpoint. "
-                "Or use --force to update a paused task in-place.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        updated = False
-        if getattr(args, "step", None):
-            prog["step"] = args.step; updated = True
-        if getattr(args, "next", None):
-            prog["next"] = args.next; updated = True
-        if getattr(args, "plan", None):
-            prog["source_plan"] = args.plan; updated = True
-        if updated:
-            _write_progress(wf_dir, slug, prog)
-            _rebuild_index(wf_dir)
-            print(f"Updated paused task {wf_dir / slug}")
-        else:
-            print("Already paused (no new fields).")
-        return
+        print(
+            f"Task '{slug}' is already paused. "
+            "Use 'resume' first, then 'pause' to checkpoint.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     prog["event"] = "paused"
     if getattr(args, "step", None):
         prog["step"] = args.step
@@ -229,7 +213,8 @@ def cmd_resume(wf_dir, args):
     if prog is None:
         print(f"Task '{slug}' not found.", file=sys.stderr); sys.exit(1)
     if prog["event"] == "active":
-        print("Already in progress."); return
+        print(f"Task '{slug}' is already in progress.", file=sys.stderr)
+        sys.exit(1)
     prog["event"] = "active"
     _write_progress(wf_dir, slug, prog)
     _rebuild_index(wf_dir)
@@ -291,7 +276,6 @@ def main():
     sp.add_argument("--step", type=str)
     sp.add_argument("--next", type=str)
     sp.add_argument("--plan", type=str)
-    sp.add_argument("--force", action="store_true", help="Allow updating a paused task without resume")
 
     sp = sub.add_parser("resume", help="Resume a paused task")
     sp.add_argument("slug", type=str)
