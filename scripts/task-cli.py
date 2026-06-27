@@ -34,23 +34,23 @@ RESET = "\033[0m"
 
 def detect_scope_dir():
     """Walk up from CWD looking for .git. Return workflows directory.
-    .git under ~/.claude/ is ignored (skill repos, dotfiles)."""
+    .git in $HOME or ~/.claude/ is ignored (dotfiles, skill repos)."""
     claude = (HOME / ".claude").resolve()
     scope_dir = Path.cwd().resolve()
     home = HOME.resolve()
 
     while True:
         if (scope_dir / ".git").exists():
-            if scope_dir == home or home not in scope_dir.parents:
+            if scope_dir == home:
                 pass  # dotfiles repo at $HOME
-            elif claude in scope_dir.parents or scope_dir == claude:
+            elif scope_dir == claude or claude in scope_dir.parents:
                 pass  # inside ~/.claude/ — skill repo, not a project
             else:
                 slug = str(scope_dir).replace(":\\", "--").replace("\\", "-").replace("/", "-").replace(":", "-")
                 return HOME / ".claude" / "projects" / slug / "workflows"
         parent = scope_dir.parent
-        if parent == scope_dir or scope_dir == home:
-            break
+        if parent == scope_dir:
+            break  # reached filesystem root
         scope_dir = parent
     return HOME / ".claude" / "global" / "workflows"
 
