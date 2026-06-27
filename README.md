@@ -95,7 +95,7 @@ Create → Active ⇄ Paused → Done（close --yes 删除目录）
 
 ## 依赖
 
-- Python 3.10+（仅标准库：`json`, `pathlib`, `argparse`, `datetime`, `time`, `shutil`）
+- Python 3.8+（仅标准库：`json`, `pathlib`, `argparse`, `datetime`, `time`, `shutil`）
 - Claude Code（用于 SessionStart hook）
 
 ## 与 memory-graph 的关系
