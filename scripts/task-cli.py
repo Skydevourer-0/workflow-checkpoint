@@ -189,6 +189,14 @@ def cmd_pause(wf_dir, args):
     if prog is None:
         print(f"Task '{slug}' not found.", file=sys.stderr); sys.exit(1)
     if prog["event"] == "paused":
+        if not getattr(args, "force", False):
+            print(
+                f"Task '{slug}' is already paused. "
+                "Use 'resume' to activate, work, then 'pause' to checkpoint. "
+                "Or use --force to update a paused task in-place.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         updated = False
         if getattr(args, "step", None):
             prog["step"] = args.step; updated = True
@@ -201,7 +209,7 @@ def cmd_pause(wf_dir, args):
             _rebuild_index(wf_dir)
             print(f"Updated paused task {wf_dir / slug}")
         else:
-            print("Already paused.")
+            print("Already paused (no new fields).")
         return
     prog["event"] = "paused"
     if getattr(args, "step", None):
@@ -278,11 +286,12 @@ def main():
     sp.add_argument("--next", type=str)
     sp.add_argument("--plan", type=str)
 
-    sp = sub.add_parser("pause", help="Pause a task")
+    sp = sub.add_parser("pause", help="Pause a task (active→paused)")
     sp.add_argument("slug", type=str)
     sp.add_argument("--step", type=str)
     sp.add_argument("--next", type=str)
     sp.add_argument("--plan", type=str)
+    sp.add_argument("--force", action="store_true", help="Allow updating a paused task without resume")
 
     sp = sub.add_parser("resume", help="Resume a paused task")
     sp.add_argument("slug", type=str)
