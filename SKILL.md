@@ -17,8 +17,9 @@ and automatic SessionStart pending-task detection.
 
 ```
 Starting from CWD, walk up directory tree.
-  → .git found below $HOME → project scope
-  → .git found at or above $HOME → ignore (dotfiles repo guard)
+  → .git found below $HOME (not under ~/.claude/) → project scope
+  → .git under ~/.claude/ → ignore (skill repo, not a project)
+  → .git at or above $HOME → ignore (dotfiles repo guard)
   → reached filesystem root without .git → global scope
 ```
 
