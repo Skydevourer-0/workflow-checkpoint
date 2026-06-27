@@ -218,7 +218,21 @@ def cmd_resume(wf_dir, args):
     prog["event"] = "active"
     _write_progress(wf_dir, slug, prog)
     _rebuild_index(wf_dir)
+
+    # Output recovery context — model reads this and continues from next step
+    recovery_path = wf_dir / slug / "recovery.md"
     print(f"Resumed {wf_dir / slug}")
+    print(f"---")
+    print(f"description: {prog.get('description', 'N/A')}")
+    print(f"step: {prog.get('step', 'N/A')}")
+    print(f"next: {prog.get('next', 'N/A')}")
+    if prog.get("source_plan"):
+        print(f"plan: {prog['source_plan']}")
+    if recovery_path.exists():
+        print(f"recovery: {recovery_path}")
+        recovery_text = recovery_path.read_text(encoding="utf-8-sig")
+        print(f"\n{recovery_text}")
+    print(f"---")
 
 
 def cmd_close(wf_dir, args):
