@@ -98,6 +98,6 @@ Create → Active ⇄ Paused → Done（close --yes 删除目录）
 - Python 3.8+（仅标准库：`json`, `pathlib`, `argparse`, `datetime`, `time`, `shutil`）
 - Claude Code（用于 SessionStart hook）
 
-## 与 memory-graph 的关系
+## 与 [Memory Lifecycle](https://github.com/Skydevourer-0/memory-lifecycle) 的关系
 
-Workflow Checkpoint 管理**任务**（暂存/恢复），memory-graph 管理**知识**（长期记忆）。两者互补但独立——数据目录分离（`global/workflows/` vs `global/memory/`），脚本分离（`task-cli.py` vs `memory-sync.py`）。
+Workflow Checkpoint 管理**任务**（暂存/恢复），memory-lifecycle 管理**知识**（长期记忆）。两者互补但独立——数据目录分离（`global/workflows/` vs `global/memory/`），脚本分离（`task-cli.py` vs `memory-sync.py`）。
