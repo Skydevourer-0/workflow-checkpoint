@@ -189,7 +189,20 @@ def cmd_pause(wf_dir, args):
     if prog is None:
         print(f"Task '{slug}' not found.", file=sys.stderr); sys.exit(1)
     if prog["event"] == "paused":
-        print("Already paused."); return
+        updated = False
+        if getattr(args, "step", None):
+            prog["step"] = args.step; updated = True
+        if getattr(args, "next", None):
+            prog["next"] = args.next; updated = True
+        if getattr(args, "plan", None):
+            prog["source_plan"] = args.plan; updated = True
+        if updated:
+            _write_progress(wf_dir, slug, prog)
+            _rebuild_index(wf_dir)
+            print(f"Updated paused task {wf_dir / slug}")
+        else:
+            print("Already paused.")
+        return
     prog["event"] = "paused"
     if getattr(args, "step", None):
         prog["step"] = args.step
