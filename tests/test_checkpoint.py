@@ -515,8 +515,18 @@ class TestCliClose:
             lines = result.stdout.strip().split("\n")
             task_id = lines[0].split()[-1]
 
+            # Fill .md with valid content (close --yes validates same as pause)
+            content = (
+                "## Completed\n\n"
+                + ("x" * 100) + "\n\n"
+                + "## Current\nWorking on tests\n\n"
+                + "## Decisions\nChose JSONL\n\n"
+                + "## Next\nRun tests\n\n"
+                + "## Key Files\ncheckpoint.py\n"
+            )
+            (Path(td) / f"{task_id}.md").write_text(content, encoding="utf-8")
+
             result = _run("close", task_id, "--yes", scope_dir=td)
-            # close --yes doesn't validate .md
             assert result.returncode == 0
             assert "Closed" in result.stdout
 
@@ -527,59 +537,4 @@ class TestCliClose:
             # Verify removed from jsonl
             records = checkpoint._read_jsonl(Path(td))
             assert len(records) == 0
-
-
-class TestCliMigrate:
-    def test_migrate_v2_to_v3(self):
-        with tempfile.TemporaryDirectory() as td:
-            wf_dir = Path(td)
-
-            # Create v2-style subdirectory
-            slug = "my-v2-task"
-            task_dir = wf_dir / slug
-            task_dir.mkdir(parents=True)
-
-            progress = {
-                "state": "active",
-                "description": "My V2 Migration Task",
-                "skill": "my-skill",
-                "ts": "2026-06-29T12:00:00Z",
-                "source_plan": "docs/superpowers/plans/my-plan.md",
-            }
-            (task_dir / "progress.json").write_text(json.dumps(progress), encoding="utf-8")
-
-            recovery = "## Old recovery content\n\nThis is the old v2 recovery."
-            (task_dir / "recovery.md").write_text(recovery, encoding="utf-8")
-
-            # Run migrate
-            result = _run("migrate", scope_dir=td)
-            assert result.returncode == 0
-            assert "Migrated" in result.stdout
-
-            # Verify v3 data
-            records = checkpoint._read_jsonl(wf_dir)
-            assert len(records) == 1
-            assert records[0]["title"] == "My V2 Migration Task"
-            assert records[0]["skill"] == "my-skill"
-            assert "docs/superpowers/plans/my-plan.md" in records[0]["source_docs"]
-
-            # Verify .md created
-            md_files = list(wf_dir.glob("*.md"))
-            assert len(md_files) == 1
-            md_content = md_files[0].read_text(encoding="utf-8")
-            assert "## Completed" in md_content
-            assert "Old recovery content" in md_content
-
-            # Verify backup created
-            backup_dir = wf_dir / "_v2_backup"
-            assert backup_dir.exists()
-            assert (backup_dir / slug).exists()
-
-    def test_migrate_nonexistent_dir(self):
-        with tempfile.TemporaryDirectory() as td:
-            # Use a subdirectory that doesn't exist, so cmd_migrate sees non-existent wf_dir
-            nonexistent = Path(td) / "nonexistent_workflows"
-            result = _run("migrate", scope_dir=str(nonexistent))
-            assert result.returncode == 0
-            assert "No v2 workflows directory found" in result.stdout
 

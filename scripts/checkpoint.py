@@ -6,7 +6,6 @@ Usage:
   checkpoint.py create <title>
   checkpoint.py pause <id> [--source-docs <path,...>] [--skill <name>]
   checkpoint.py close <id> [--yes]
-  checkpoint.py migrate
 
 Scope is auto-detected from CWD via .git upward lookup.
 Use --scope-dir <path> to override (for testing).
@@ -65,6 +64,27 @@ def _resolve(args: Any) -> Path:
     if hasattr(args, "scope_dir") and args.scope_dir:
         return Path(args.scope_dir)
     return detect_scope_dir()
+
+
+def _find_project_root() -> Optional[Path]:
+    """Find the nearest git root, respecting the same guard rules as
+    detect_scope_dir. Returns None for global scope (no valid project git)."""
+    claude = (HOME / ".claude").resolve()
+    home = HOME.resolve()
+    probe = Path.cwd().resolve()
+    while True:
+        if (probe / ".git").exists():
+            if probe == home:
+                pass  # dotfiles repo at $HOME
+            elif probe == claude or claude in probe.parents:
+                pass  # inside ~/.claude/ — skill repo
+            else:
+                return probe
+        parent = probe.parent
+        if parent == probe:
+            break
+        probe = parent
+    return None
 
 
 # ── ID Generation ───────────────────────────────────────────────────────────
@@ -167,6 +187,11 @@ def _validate_md(md_path: Path) -> List[str]:
         return [f"File not found: {md_path}"]
 
     content = md_path.read_text(encoding="utf-8")
+
+    # Strip HTML comments before validation so template scaffolding
+    # doesn't count toward content minima
+    content = re.sub(r"<!--.*?-->", "", content, flags=re.DOTALL)
+
     errors: List[str] = []
 
     # 5 section headers must all exist
@@ -368,19 +393,7 @@ def cmd_create(wf_dir: Path, args: Any) -> None:
         sys.exit(1)
 
     # Resolve scope for source-doc scanning
-    project_root: Optional[Path] = None
-    scope_path = wf_dir.resolve()
-    if "global" not in str(scope_path):
-        cwd = Path.cwd().resolve()
-        probe = cwd
-        while True:
-            if (probe / ".git").exists():
-                project_root = probe
-                break
-            parent = probe.parent
-            if parent == probe:
-                break
-            probe = parent
+    project_root = _find_project_root()
 
     # Parse timestamps for source-doc scan
     created_ts = _parse_ts_from_id(task_id)
@@ -450,17 +463,7 @@ def cmd_pause(wf_dir: Path, args: Any) -> None:
                 existing_docs.add(p)
 
     # Auto-scan for new docs
-    project_root: Optional[Path] = None
-    cwd = Path.cwd().resolve()
-    probe = cwd
-    while True:
-        if (probe / ".git").exists():
-            project_root = probe
-            break
-        parent = probe.parent
-        if parent == probe:
-            break
-        probe = parent
+    project_root = _find_project_root()
 
     created_ts = _parse_ts_from_id(task_id)
     updated_ts = datetime.fromisoformat(now)
@@ -529,17 +532,7 @@ def cmd_close(wf_dir: Path, args: Any) -> None:
     for doc_path in record.get("source_docs", []):
         p = Path(doc_path)
         if not p.is_absolute():
-            project_root: Optional[Path] = None
-            cwd = Path.cwd().resolve()
-            probe = cwd
-            while True:
-                if (probe / ".git").exists():
-                    project_root = probe
-                    break
-                parent = probe.parent
-                if parent == probe:
-                    break
-                probe = parent
+            project_root = _find_project_root()
             if project_root:
                 p = project_root / p
             else:
@@ -556,79 +549,6 @@ def cmd_close(wf_dir: Path, args: Any) -> None:
 
     print(f"Closed {task_id}")
 
-
-def cmd_migrate(wf_dir: Path) -> None:
-    """Migrate v2 <slug>/ subdirectory data to v3 flat-file format."""
-    if not wf_dir.exists():
-        print("No v2 workflows directory found.")
-        return
-
-    # Check if v3 data already exists
-    if (wf_dir / "workflows.jsonl").exists():
-        print("workflows.jsonl already exists. Migration may have already run.", file=sys.stderr)
-        print("Delete workflows.jsonl first if you want to re-migrate.", file=sys.stderr)
-        sys.exit(1)
-
-    # Find v2 subdirectories (those containing progress.json)
-    migrated = 0
-    backup_dir = wf_dir / "_v2_backup"
-    backup_dir.mkdir(exist_ok=True)
-
-    for d in sorted(wf_dir.iterdir()):
-        if not d.is_dir() or d.name.startswith("_"):
-            continue
-        progress_file = d / "progress.json"
-        if not progress_file.exists():
-            continue
-
-        # Read v2 data
-        prog = json.loads(progress_file.read_text(encoding="utf-8"))
-        slug = d.name
-        title = prog.get("description", slug)
-        skill = prog.get("skill")
-        ts_str = prog.get("ts", datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
-        try:
-            ts = datetime.fromisoformat(ts_str)
-        except ValueError:
-            ts = datetime.now(timezone.utc)
-
-        # Generate v3 id
-        task_id = _generate_id(title, ts)
-
-        # Build v3 record
-        record = {
-            "id": task_id,
-            "title": title,
-            "created": ts.isoformat(),
-            "updated": ts.isoformat(),
-            "skill": skill,
-            "source_docs": [prog["source_plan"]] if prog.get("source_plan") else [],
-        }
-
-        # Read recovery.md and wrap in v3 template
-        recovery_file = d / "recovery.md"
-        if recovery_file.exists():
-            original = recovery_file.read_text(encoding="utf-8")
-        else:
-            original = "Task migrated from v2."
-
-        md_content = f"## Completed\n\n{original}\n\n## Current\n\n(see Completed)\n\n## Decisions\n\n\n## Next\n\n\n## Key Files\n"
-        (wf_dir / f"{task_id}.md").write_text(md_content, encoding="utf-8")
-
-        # Write to jsonl
-        records = _read_jsonl(wf_dir)
-        records.append(record)
-        _write_jsonl(wf_dir, records)
-
-        # Move old directory to backup
-        shutil.move(str(d), str(backup_dir / d.name))
-        migrated += 1
-        print(f"  Migrated: {slug} -> {task_id}")
-
-    if migrated == 0:
-        print("No v2 tasks found to migrate.")
-    else:
-        print(f"\nMigrated {migrated} task(s). Old data moved to {backup_dir}")
 
 
 # ── CLI ─────────────────────────────────────────────────────────────────────
@@ -655,8 +575,6 @@ def main() -> None:
     sp.add_argument("id", type=str, help="Task id")
     sp.add_argument("--yes", action="store_true", help="Execute deletion")
 
-    sp = sub.add_parser("migrate", help="Migrate v2 <slug>/ subdirectories to v3 flat files")
-
     args = p.parse_args()
     if not args.command:
         p.print_help()
@@ -672,9 +590,5 @@ def main() -> None:
         cmd_pause(wf_dir, args)
     elif args.command == "close":
         cmd_close(wf_dir, args)
-    elif args.command == "migrate":
-        cmd_migrate(wf_dir)
-
-
 if __name__ == "__main__":
     main()

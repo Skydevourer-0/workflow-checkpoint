@@ -1,5 +1,3 @@
 __pycache__/
 *.pyc
 *.pyo
-hooks/check-pending-tasks.ps1
-hooks/check-pending-tasks.sh
