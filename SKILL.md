@@ -8,20 +8,20 @@ description: Use when tracking tasks, pausing/resuming work across sessions, che
 JSONL flat-file task checkpoint. Script owns all writes; model only edits `.md` recovery files.
 Scope is auto-detected from CWD. Use `--scope-dir <path>` only for testing.
 
-**Script:** `~/.claude/skills/workflow-checkpoint/scripts/checkpoint.py`
+Let `CP` = `$HOME/.claude/skills/workflow-checkpoint/scripts/checkpoint.py`
 
 ## Commands
 
 ```
-python3 ~/.claude/skills/workflow-checkpoint/scripts/checkpoint.py list [--hook]
-python3 ~/.claude/skills/workflow-checkpoint/scripts/checkpoint.py create <title>
-python3 ~/.claude/skills/workflow-checkpoint/scripts/checkpoint.py pause <id> [--source-docs <path,...>] [--skill <name>]
-python3 ~/.claude/skills/workflow-checkpoint/scripts/checkpoint.py close <id> [--yes]
+python3 $CP list [--hook]
+python3 $CP create <title> --note <context>
+python3 $CP pause <id> [--source-docs <path,...>] [--skill <name>]
+python3 $CP close <id> [--yes]
 ```
 
 ## When to Use Each Command
 
-**Start a task:** `create "short descriptive title"` — the script prints the generated id; remember it.
+**Start a task or capture a quick idea:** `create "short descriptive title" --note "what prompted this and what to do"`. `--note` is required. The note seeds `## Current` in the `.md` so the model has context on resume — one sentence is enough for a quick mid-task capture. The script prints the generated id; remember it.
 
 **Check pending tasks:** `list` — sorts by heat (days since `updated`). >=7 days yellow, >=14 red.
 
@@ -72,5 +72,5 @@ Candidates shown on stdout; model can pass `--source-docs` to add paths manually
 ## Setup
 
 ```bash
-python3 ~/.claude/skills/workflow-checkpoint/scripts/install.py
+python3 $CP/../install.py
 ```

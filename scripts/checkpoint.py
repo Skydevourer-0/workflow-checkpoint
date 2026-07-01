@@ -3,7 +3,7 @@
 
 Usage:
   checkpoint.py list [--hook]
-  checkpoint.py create <title>
+  checkpoint.py create <title> --note <context>
   checkpoint.py pause <id> [--source-docs <path,...>] [--skill <name>]
   checkpoint.py close <id> [--yes]
 
@@ -174,10 +174,28 @@ _TEMPLATE = """<!-- Write ALL sections in English. -->
 """
 
 
-def _generate_md(wf_dir: Path, task_id: str) -> Path:
-    """Write template <id>.md file."""
+def _generate_md(wf_dir: Path, task_id: str, note: str) -> Path:
+    """Write recovery .md with note seeded into ## Current."""
+    # Seed note into ## Current; use repr() to avoid injection but keep readable
+    lines = _TEMPLATE.splitlines()
+    out: List[str] = []
+    in_current = False
+    for line in lines:
+        if line.startswith("## Current"):
+            out.append(line)
+            out.append("")  # blank after header
+            out.append(note)
+            out.append("")
+            in_current = True
+        elif in_current and line.startswith("<!--"):
+            continue  # skip the template comment for Current
+        elif in_current and line.startswith("## "):
+            in_current = False
+            out.append(line)
+        elif not in_current:
+            out.append(line)
     md_path = wf_dir / f"{task_id}.md"
-    md_path.write_text(_TEMPLATE, encoding="utf-8")
+    md_path.write_text("\n".join(out), encoding="utf-8")
     return md_path
 
 
@@ -382,6 +400,10 @@ def cmd_list(wf_dir: Path, args: Any) -> None:
 
 def cmd_create(wf_dir: Path, args: Any) -> None:
     title: str = args.title
+    note: str = args.note
+    if not note.strip():
+        print("--note is required and must not be empty.", file=sys.stderr)
+        sys.exit(1)
     task_id = _generate_id(title)
     now = _now_iso()
 
@@ -406,6 +428,7 @@ def cmd_create(wf_dir: Path, args: Any) -> None:
     record = {
         "id": task_id,
         "title": title,
+        "note": note.strip(),
         "created": now,
         "updated": now,
         "skill": None,
@@ -415,11 +438,12 @@ def cmd_create(wf_dir: Path, args: Any) -> None:
     records.append(record)
     _write_jsonl(wf_dir, records)
 
-    # Generate .md template
-    md_path = _generate_md(wf_dir, task_id)
+    # Generate .md with note seeded into ## Current
+    md_path = _generate_md(wf_dir, task_id, note.strip())
 
     print(f"Created {task_id}")
     print(f"  title: {title}")
+    print(f"  note: {note.strip()}")
     print(f"  md: {md_path}")
     if candidates:
         print(f"  source-doc candidates:")
@@ -571,6 +595,7 @@ def main() -> None:
 
     sp = sub.add_parser("create", help="Create a new task")
     sp.add_argument("title", type=str, help="Human-readable task title")
+    sp.add_argument("--note", type=str, required=True, help="Context for resume (what prompted this, what to do)")
 
     sp = sub.add_parser("pause", help="Validate .md and refresh updated timestamp")
     sp.add_argument("id", type=str, help="Task id (yyyyMMdd-HHmmss-slug)")
