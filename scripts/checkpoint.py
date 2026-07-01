@@ -493,6 +493,7 @@ def cmd_close(wf_dir: Path, args: Any) -> None:
         sys.exit(1)
 
     md_path = wf_dir / f"{task_id}.md"
+    md_exists = md_path.exists()
 
     # Dry-run
     if not args.yes:
@@ -507,7 +508,10 @@ def cmd_close(wf_dir: Path, args: Any) -> None:
         else:
             print("Source docs: (none)")
         print(f"\nFiles to delete:")
-        print(f"  {md_path} (.md recovery)")
+        if md_exists:
+            print(f"  {md_path} (.md recovery)")
+        else:
+            print(f"  {md_path} (.md recovery — MISSING)")
         print(f"  workflows.jsonl line for {task_id}")
         for d in record.get("source_docs", []):
             print(f"  {d}")
@@ -515,20 +519,26 @@ def cmd_close(wf_dir: Path, args: Any) -> None:
         print("\nRun `close <id> --yes` to execute deletion.")
         return
 
-    # Validate .md before deleting (same rules as pause)
-    errors = _validate_md(md_path)
-    if errors:
-        print("Validation failed:", file=sys.stderr)
-        for e in errors:
-            print(f"  - {e}", file=sys.stderr)
-        sys.exit(1)
+    # 1. Remove record from JSONL FIRST — JSONL cleanup must not depend on .md state
+    del records[idx]
+    _write_jsonl(wf_dir, records)
 
-    # Execute deletion
-    # 1. Delete .md file
-    md_path.unlink()
-    print(f"  DELETED: {md_path}")
+    # 2. Delete .md file (validate if present, warn if missing)
+    if md_exists:
+        errors = _validate_md(md_path)
+        if errors:
+            # JSONL is already updated; warn about validation failures but don't abort
+            print("Warning: .md validation issues:", file=sys.stderr)
+            for e in errors:
+                print(f"  - {e}", file=sys.stderr)
+            print(f"  (JSONL record already removed; .md kept for review)", file=sys.stderr)
+        else:
+            md_path.unlink()
+            print(f"  DELETED: {md_path}")
+    else:
+        print(f"  WARNING: .md recovery file not found: {md_path}")
 
-    # 2. Delete source_docs (only docs/superpowers/ paths)
+    # 3. Delete source_docs (only docs/superpowers/ paths)
     for doc_path in record.get("source_docs", []):
         p = Path(doc_path)
         if not p.is_absolute():
@@ -542,10 +552,6 @@ def cmd_close(wf_dir: Path, args: Any) -> None:
             print(f"  DELETED: {p}")
         elif p.exists():
             print(f"  SKIPPED (outside docs/superpowers/): {p}")
-
-    # 3. Remove record from jsonl
-    del records[idx]
-    _write_jsonl(wf_dir, records)
 
     print(f"Closed {task_id}")
 
