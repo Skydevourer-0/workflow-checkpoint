@@ -19,6 +19,8 @@ python3 $CP pause <id> [--source-docs <path,...>] [--skill <name>]
 python3 $CP close <id> [--yes]
 ```
 
+`list` flags are mutually exclusive in effect: `--closed` lists archived tasks (text); `--hook` emits SessionStart JSON for pending tasks. If both are passed, `--closed` wins and emits text — the SessionStart hook is configured with `--hook` only (see `install.py`), so this never triggers in practice.
+
 ## When to Use Each Command
 
 **Start a task or capture a quick idea:** `create "short descriptive title" --note "what prompted this and what to do"`. `--note` is required. The note seeds `## Current` in the `.md` so the model has context on resume — one sentence is enough for a quick mid-task capture. The script prints the generated id; remember it.
@@ -36,6 +38,14 @@ python3 $CP close <id> [--yes]
 **Resume a task:** Read `~/.claude/{global|projects/<slug>}/workflows/<id>.md` directly. Load `skill` if non-null. Start from `## Next`.
 
 **Close a task:** `close <id>` (dry-run, shows what will be archived) → if knowledge worth keeping, archive first via memory skill → `close <id> --yes` (validates .md same as pause, then archives). Closing does NOT delete: the record moves from `workflows.jsonl` to `archive.jsonl` (with `status=closed` + `closed_at`), the `.md` moves to an `archived/` subdirectory, and `source_docs` are kept in place. Recover with `list --closed` or by reading `archived/<id>.md` directly. The `<id>` keeps its `yyyyMMdd-HHmmss-<slug>` name, so archived work stays retrievable by date or topic via `find`.
+
+**Retrieve closed work:**
+- `list --closed` — lists archived tasks. Output format: `Archived tasks (N)` header, then one line per task: `<id> — <title>  (closed YYYY-MM-DD)`, sorted most-recently-closed first. Duplicate ids (from manual-edit corruption) are deduped automatically.
+- By date: `find ~/.claude/{global,projects/*/}/workflows/archived/ -name "202607*.md"` (all July 2026 work).
+- By topic: `find ~/.claude/{global,projects/*/}/workflows/archived/ -name "*thor-stage1*.md"`.
+- Read a specific task: `~/.claude/{global|projects/<slug>}/workflows/archived/<id>.md`.
+
+**Archiving vs memory:** Closing archives the *work record* (what was done, decisions, files) for traceability — it does NOT extract reusable technical knowledge. If the task produced a reusable conclusion (a debugging lesson, an operator finding, a cross-session engineering insight), sink it via the memory skill *before* `close --yes`. The archive is a log; memory is the knowledge base.
 
 ## Storage
 

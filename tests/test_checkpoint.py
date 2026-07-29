@@ -571,6 +571,29 @@ class TestCliClose:
             assert task_id in result.stdout
             assert "closed" in result.stdout.lower()
 
+    def test_list_closed_dedupes_duplicate_ids(self):
+        """If archive.jsonl has duplicate ids (manual edit corruption),
+        list --closed shows each id only once."""
+        with tempfile.TemporaryDirectory() as td:
+            result = _run("create", "Dedup Test", "--note", "Dedup Test note", scope_dir=td)
+            task_id = result.stdout.strip().split("\n")[0].split()[-1]
+            content = (
+                "## Completed\n\n" + ("x" * 100) + "\n\n"
+                + "## Current\nDone\n\n## Next\nNothing\n\n## Key Files\nf.py\n"
+            )
+            (Path(td) / f"{task_id}.md").write_text(content, encoding="utf-8")
+            _run("close", task_id, "--yes", scope_dir=td)
+
+            # Corrupt archive.jsonl: duplicate the record (simulate manual edit error)
+            archive_path = Path(td) / "archive.jsonl"
+            original_line = archive_path.read_text(encoding="utf-8")
+            archive_path.write_text(original_line + original_line, encoding="utf-8")
+
+            result = _run("list", "--closed", scope_dir=td)
+            # task_id should appear exactly once in the listing
+            count = result.stdout.count(task_id)
+            assert count == 1, f"expected task_id once, got {count}\n{result.stdout}"
+
     def test_close_keeps_source_docs(self):
         with tempfile.TemporaryDirectory() as td:
             # Set up a fake project root with a source doc

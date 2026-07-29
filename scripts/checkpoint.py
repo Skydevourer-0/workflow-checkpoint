@@ -405,7 +405,14 @@ def cmd_list(wf_dir: Path, args: Any) -> None:
         if not records:
             print("No archived tasks.")
             return
-        entries = list(records)
+        # Dedupe by id (defend against manual-edit corruption of archive.jsonl);
+        # keep first occurrence, preserving read order.
+        seen = set()
+        entries = []
+        for r in records:
+            if r["id"] not in seen:
+                seen.add(r["id"])
+                entries.append(r)
         # Sort by closed_at descending (most recently closed first)
         entries.sort(key=lambda r: r.get("closed_at", r.get("updated", "")), reverse=True)
         print(f"Archived tasks ({len(entries)})")
