@@ -21,7 +21,7 @@ PYTHON = sys.executable  # the Python running right now — zero search needed
 def main():
     dry_run = "--dry-run" in sys.argv
 
-    cmd = f"{PYTHON} {CHECKPOINT} list --hook"
+    cmd = f'"{PYTHON}" "{CHECKPOINT}" list --hook'
 
     hook_json = {
         "type": "command",
