@@ -13,7 +13,7 @@ Let `CP` = `$HOME/.claude/skills/workflow-checkpoint/scripts/checkpoint.py`
 ## Commands
 
 ```
-python3 $CP list [--hook]
+python3 $CP list [--hook] [--closed]
 python3 $CP create <title> --note <context>
 python3 $CP pause <id> [--source-docs <path,...>] [--skill <name>]
 python3 $CP close <id> [--yes]
@@ -23,7 +23,7 @@ python3 $CP close <id> [--yes]
 
 **Start a task or capture a quick idea:** `create "short descriptive title" --note "what prompted this and what to do"`. `--note` is required. The note seeds `## Current` in the `.md` so the model has context on resume — one sentence is enough for a quick mid-task capture. The script prints the generated id; remember it.
 
-**Check pending tasks:** `list` — sorts by heat (days since `updated`). >=7 days yellow, >=14 red.
+**Check pending tasks:** `list` — sorts by heat (days since `updated`). >=7 days yellow, >=14 red. `list --closed` shows archived (closed) tasks with their close date — for traceability, closed tasks are kept (not deleted).
 
 **Pause/save progress:**
 1. Identify the task id (from `list` or context)
@@ -35,14 +35,16 @@ python3 $CP close <id> [--yes]
 
 **Resume a task:** Read `~/.claude/{global|projects/<slug>}/workflows/<id>.md` directly. Load `skill` if non-null. Start from `## Next`.
 
-**Close a task:** `close <id>` (dry-run, shows what will be deleted) → if knowledge worth keeping, archive first → `close <id> --yes` (validates .md same as pause, then deletes)
+**Close a task:** `close <id>` (dry-run, shows what will be archived) → if knowledge worth keeping, archive first via memory skill → `close <id> --yes` (validates .md same as pause, then archives). Closing does NOT delete: the record moves from `workflows.jsonl` to `archive.jsonl` (with `status=closed` + `closed_at`), the `.md` moves to an `archived/` subdirectory, and `source_docs` are kept in place. Recover with `list --closed` or by reading `archived/<id>.md` directly. The `<id>` keeps its `yyyyMMdd-HHmmss-<slug>` name, so archived work stays retrievable by date or topic via `find`.
 
 ## Storage
 
 ```
 ~/.claude/global/workflows/<id>.md          (no .git found)
 ~/.claude/projects/<slug>/workflows/<id>.md (project .git found)
-~/.claude/{...}/workflows/workflows.jsonl   (script-owned — NEVER touch)
+~/.claude/{...}/workflows/workflows.jsonl   (pending tasks — script-owned, NEVER touch)
+~/.claude/{...}/workflows/archive.jsonl     (closed tasks — script-owned, NEVER touch)
+~/.claude/{...}/workflows/archived/<id>.md  (closed-task recovery files)
 ```
 
 ## .md Template

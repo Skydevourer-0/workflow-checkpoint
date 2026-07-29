@@ -145,6 +145,41 @@ def _find_record(records: List[Dict], task_id: str) -> Tuple[int, Optional[Dict]
     return -1, None
 
 
+def _archive_path(wf_dir: Path) -> Path:
+    """Path to the archive JSONL (closed tasks)."""
+    return wf_dir / "archive.jsonl"
+
+
+def _archived_md_dir(wf_dir: Path) -> Path:
+    """Directory holding archived .md recovery files."""
+    return wf_dir / "archived"
+
+
+def _read_archive(wf_dir: Path) -> List[Dict]:
+    """Read all closed records from archive.jsonl."""
+    fp = _archive_path(wf_dir)
+    if not fp.exists():
+        return []
+    records: List[Dict] = []
+    for line in fp.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line:
+            records.append(json.loads(line))
+    return records
+
+
+def _append_archive(wf_dir: Path, record: Dict) -> None:
+    """Append a single closed record to archive.jsonl (atomic: temp + rename)."""
+    wf_dir.mkdir(parents=True, exist_ok=True)
+    fp = _archive_path(wf_dir)
+    existing = _read_archive(wf_dir)
+    existing.append(record)
+    lines = [json.dumps(r, ensure_ascii=False) + "\n" for r in existing]
+    tmp = wf_dir / ".archive.jsonl.tmp"
+    tmp.write_text("".join(lines), encoding="utf-8")
+    tmp.replace(fp)
+
+
 def _now_iso() -> str:
     """Current time as ISO 8601 with timezone."""
     return datetime.now(timezone.utc).isoformat()
@@ -364,6 +399,23 @@ def _color(heat: float) -> str:
 # ── Commands ────────────────────────────────────────────────────────────────
 
 def cmd_list(wf_dir: Path, args: Any) -> None:
+    # --closed: list archived (closed) tasks instead of pending
+    if getattr(args, "closed", False):
+        records = _read_archive(wf_dir)
+        if not records:
+            print("No archived tasks.")
+            return
+        entries = list(records)
+        # Sort by closed_at descending (most recently closed first)
+        entries.sort(key=lambda r: r.get("closed_at", r.get("updated", "")), reverse=True)
+        print(f"Archived tasks ({len(entries)})")
+        for r in entries:
+            closed_at = r.get("closed_at", r.get("updated", "?"))
+            # Trim to date for display
+            closed_date = closed_at[:10] if len(closed_at) >= 10 else closed_at
+            print(f"  {r['id']} — {r['title']}  (closed {closed_date})")
+        return
+
     records = _read_jsonl(wf_dir)
 
     # --hook: output SessionStart JSON to stdout
@@ -526,58 +578,51 @@ def cmd_close(wf_dir: Path, args: Any) -> None:
         print(f"Created: {record['created']}")
         print(f"Updated: {record['updated']}")
         if record.get("source_docs"):
-            print(f"Source docs to delete:")
+            print(f"Source docs (kept in place):")
             for d in record["source_docs"]:
                 print(f"  {d}")
         else:
             print("Source docs: (none)")
-        print(f"\nFiles to delete:")
+        print(f"\nArchive actions:")
         if md_exists:
-            print(f"  {md_path} (.md recovery)")
+            print(f"  {md_path} -> {_archived_md_dir(wf_dir) / md_path.name}")
         else:
             print(f"  {md_path} (.md recovery — MISSING)")
-        print(f"  workflows.jsonl line for {task_id}")
-        for d in record.get("source_docs", []):
-            print(f"  {d}")
+        print(f"  workflows.jsonl line -> archive.jsonl (status=closed)")
         print("\n提醒: 如有可复用的技术知识请先通过 memory skill 沉淀。")
-        print("\nRun `close <id> --yes` to execute deletion.")
+        print("\nRun `close <id> --yes` to archive (no deletion).")
         return
 
-    # 1. Remove record from JSONL FIRST — JSONL cleanup must not depend on .md state
-    del records[idx]
-    _write_jsonl(wf_dir, records)
-
-    # 2. Delete .md file (validate if present, warn if missing)
+    # 1. Validate .md if present (warn on issues, but still archive)
     if md_exists:
         errors = _validate_md(md_path)
         if errors:
-            # JSONL is already updated; warn about validation failures but don't abort
             print("Warning: .md validation issues:", file=sys.stderr)
             for e in errors:
                 print(f"  - {e}", file=sys.stderr)
-            print(f"  (JSONL record already removed; .md kept for review)", file=sys.stderr)
-        else:
-            md_path.unlink()
-            print(f"  DELETED: {md_path}")
+
+    # 2. Move .md to archived/ subdirectory
+    archived_dir = _archived_md_dir(wf_dir)
+    archived_dir.mkdir(parents=True, exist_ok=True)
+    archived_md = archived_dir / md_path.name
+    if md_exists:
+        shutil.move(str(md_path), str(archived_md))
+        print(f"  ARCHIVED: {md_path} -> {archived_md}")
     else:
-        print(f"  WARNING: .md recovery file not found: {md_path}")
+        print(f"  WARNING: .md recovery file not found: {md_path}", file=sys.stderr)
 
-    # 3. Delete source_docs (only docs/superpowers/ paths)
-    for doc_path in record.get("source_docs", []):
-        p = Path(doc_path)
-        if not p.is_absolute():
-            project_root = _find_project_root()
-            if project_root:
-                p = project_root / p
-            else:
-                p = HOME / ".claude" / p
-        if p.exists() and "docs/superpowers" in str(p):
-            p.unlink()
-            print(f"  DELETED: {p}")
-        elif p.exists():
-            print(f"  SKIPPED (outside docs/superpowers/): {p}")
+    # 3. Move record from workflows.jsonl to archive.jsonl (with status + closed_at)
+    del records[idx]
+    _write_jsonl(wf_dir, records)
+    record["status"] = "closed"
+    record["closed_at"] = _now_iso()
+    _append_archive(wf_dir, record)
 
-    print(f"Closed {task_id}")
+    # 4. source_docs are KEPT in place (no deletion) for traceability
+    if record.get("source_docs"):
+        print(f"  Source docs kept in place ({len(record['source_docs'])} file(s))")
+
+    print(f"Closed {task_id} (archived)")
 
 
 
@@ -592,6 +637,7 @@ def main() -> None:
 
     sp = sub.add_parser("list", help="List pending tasks (sorted by heat)")
     sp.add_argument("--hook", action="store_true", help="Output SessionStart JSON for hook consumption")
+    sp.add_argument("--closed", action="store_true", help="List archived (closed) tasks instead of pending")
 
     sp = sub.add_parser("create", help="Create a new task")
     sp.add_argument("title", type=str, help="Human-readable task title")

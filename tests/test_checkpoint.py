@@ -199,7 +199,7 @@ class TestNowIso:
 class TestGenerateMd:
     def test_file_created_with_all_headers(self, tmp_path):
         task_id = "20260629-120000-test-task"
-        md_path = checkpoint._generate_md(tmp_path, task_id)
+        md_path = checkpoint._generate_md(tmp_path, task_id, "seed note")
         assert md_path.exists()
         content = md_path.read_text(encoding="utf-8")
         assert "## Completed" in content
@@ -210,7 +210,7 @@ class TestGenerateMd:
 
     def test_returns_correct_path(self, tmp_path):
         task_id = "20260629-120000-test-task"
-        md_path = checkpoint._generate_md(tmp_path, task_id)
+        md_path = checkpoint._generate_md(tmp_path, task_id, "seed note")
         assert md_path.name == f"{task_id}.md"
         assert md_path.parent == tmp_path
 
@@ -418,7 +418,7 @@ class TestCliCreateAndList:
     def test_create_and_list(self):
         with tempfile.TemporaryDirectory() as td:
             # Create
-            result = _run("create", "My Test Task", scope_dir=td)
+            result = _run("create", "My Test Task", "--note", "My Test Task note", scope_dir=td)
             assert "Created" in result.stdout
             assert "My Test Task" in result.stdout
 
@@ -430,10 +430,10 @@ class TestCliCreateAndList:
 class TestCliCreateDuplicate:
     def test_create_duplicate_fails(self):
         with tempfile.TemporaryDirectory() as td:
-            _run("create", "Duplicate Task", scope_dir=td)
+            _run("create", "Duplicate Task", "--note", "Duplicate Task note", scope_dir=td)
             # Create same title within same second — id is deterministic by timestamp,
             # so we need to extract the id or create quickly
-            result = _run("create", "Duplicate Task", scope_dir=td)
+            result = _run("create", "Duplicate Task", "--note", "Duplicate Task note", scope_dir=td)
             # Either fails with non-zero exit or the id is different (different second)
             # The check is by generated id, not by title alone
             if result.returncode != 0:
@@ -448,7 +448,7 @@ class TestCliCreateDuplicate:
 class TestCliPauseValidation:
     def test_pause_validation_fails(self):
         with tempfile.TemporaryDirectory() as td:
-            result = _run("create", "Pause Test", scope_dir=td)
+            result = _run("create", "Pause Test", "--note", "Pause Test note", scope_dir=td)
             # Extract task id from output
             lines = result.stdout.strip().split("\n")
             task_id = lines[0].split()[-1]
@@ -465,7 +465,7 @@ class TestCliPauseValidation:
 
     def test_pause_validation_passes(self):
         with tempfile.TemporaryDirectory() as td:
-            result = _run("create", "Pause Test", scope_dir=td)
+            result = _run("create", "Pause Test", "--note", "Pause Test note", scope_dir=td)
             lines = result.stdout.strip().split("\n")
             task_id = lines[0].split()[-1]
 
@@ -489,7 +489,7 @@ class TestCliPauseValidation:
 class TestCliClose:
     def test_close_dryrun(self):
         with tempfile.TemporaryDirectory() as td:
-            result = _run("create", "Close Test", scope_dir=td)
+            result = _run("create", "Close Test", "--note", "Close Test note", scope_dir=td)
             lines = result.stdout.strip().split("\n")
             task_id = lines[0].split()[-1]
 
@@ -506,12 +506,13 @@ class TestCliClose:
 
             result = _run("close", task_id, scope_dir=td)
             assert result.returncode == 0
-            assert "Files to delete" in result.stdout
+            assert "Archive actions" in result.stdout
+            assert "archive.jsonl" in result.stdout
             assert task_id in result.stdout
 
     def test_close_yes(self):
         with tempfile.TemporaryDirectory() as td:
-            result = _run("create", "Close Test", scope_dir=td)
+            result = _run("create", "Close Test", "--note", "Close Test note", scope_dir=td)
             lines = result.stdout.strip().split("\n")
             task_id = lines[0].split()[-1]
 
@@ -529,12 +530,67 @@ class TestCliClose:
             result = _run("close", task_id, "--yes", scope_dir=td)
             assert result.returncode == 0
             assert "Closed" in result.stdout
+            assert "archived" in result.stdout
 
-            # Verify .md is deleted
+            # .md moved to archived/ (not deleted)
             md_path = Path(td) / f"{task_id}.md"
             assert not md_path.exists()
+            archived_md = Path(td) / "archived" / f"{task_id}.md"
+            assert archived_md.exists()
 
-            # Verify removed from jsonl
+            # Removed from workflows.jsonl
             records = checkpoint._read_jsonl(Path(td))
             assert len(records) == 0
+
+            # Present in archive.jsonl with status=closed
+            archive = checkpoint._read_archive(Path(td))
+            assert len(archive) == 1
+            assert archive[0]["id"] == task_id
+            assert archive[0]["status"] == "closed"
+            assert "closed_at" in archive[0]
+
+    def test_list_closed_shows_archived(self):
+        with tempfile.TemporaryDirectory() as td:
+            result = _run("create", "Archive List Test", "--note", "Archive List Test note", scope_dir=td)
+            lines = result.stdout.strip().split("\n")
+            task_id = lines[0].split()[-1]
+            content = (
+                "## Completed\n\n" + ("x" * 100) + "\n\n"
+                + "## Current\nDone\n\n## Next\nNothing\n\n## Key Files\nf.py\n"
+            )
+            (Path(td) / f"{task_id}.md").write_text(content, encoding="utf-8")
+            _run("close", task_id, "--yes", scope_dir=td)
+
+            # list (pending) should be empty
+            result = _run("list", scope_dir=td)
+            assert "No tasks" in result.stdout
+
+            # list --closed should show the archived task
+            result = _run("list", "--closed", scope_dir=td)
+            assert "Archived tasks" in result.stdout
+            assert task_id in result.stdout
+            assert "closed" in result.stdout.lower()
+
+    def test_close_keeps_source_docs(self):
+        with tempfile.TemporaryDirectory() as td:
+            # Set up a fake project root with a source doc
+            project_root = Path(td) / "proj"
+            docs_dir = project_root / "docs" / "superpowers" / "plans"
+            docs_dir.mkdir(parents=True)
+            doc = docs_dir / "2026-07-29-test-plan.md"
+            doc.write_text("# plan", encoding="utf-8")
+
+            result = _run("create", "Doc Keep Test", "--note", "Doc Keep Test note", scope_dir=td)
+            task_id = result.stdout.strip().split("\n")[0].split()[-1]
+            content = (
+                "## Completed\n\n" + ("x" * 100) + "\n\n"
+                + "## Current\nDone\n\n## Next\nNothing\n\n## Key Files\nf.py\n"
+            )
+            (Path(td) / f"{task_id}.md").write_text(content, encoding="utf-8")
+            # Attach the source doc via pause, then close
+            _run("pause", task_id, "--source-docs", str(doc), scope_dir=td)
+            _run("close", task_id, "--yes", scope_dir=td)
+
+            # source doc must still exist (not deleted)
+            assert doc.exists(), "source doc should be kept after close"
 
