@@ -14,6 +14,7 @@ Use --scope-dir <path> to override (for testing).
 import json
 import re
 import shutil
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -219,7 +220,11 @@ def _generate_md(wf_dir: Path, task_id: str, note: str) -> Path:
         if line.startswith("## Current"):
             out.append(line)
             out.append("")  # blank after header
+            # Wrap the note in an initial stream marker pair so streams are
+            # first-class from t=0 (docs/spec-archive-stream.md §1.3).
+            out.append("<!-- stream:start:initial -->")
             out.append(note)
+            out.append("<!-- stream:end:initial -->")
             out.append("")
             in_current = True
         elif in_current and line.startswith("<!--"):
@@ -234,18 +239,155 @@ def _generate_md(wf_dir: Path, task_id: str, note: str) -> Path:
     return md_path
 
 
-def _validate_md(md_path: Path) -> List[str]:
+def _validate_markers(content: str, task_id: str) -> List[str]:
+    """Validate stream markers in RAW .md content (before comment stripping).
+
+    Returns a list of error messages (empty = valid). Markers are HTML comments
+    of the form `<!-- stream:start:<name> -->` / `<!-- stream:end:<name> -->`.
+    See docs/spec-archive-stream.md §2.2 for the 4 assertions.
+
+    Runs on RAW content (callers must invoke before the L246 comment-strip);
+    markers are HTML comments and would be stripped otherwise.
+    """
+    errors: List[str] = []
+    suffix = f"in {task_id}.md — edit {task_id}.md"
+
+    # Split out fenced code blocks so literal markers inside ``` are ignored.
+    MARKER_RE = re.compile(r"<!-- stream:(start|end):([a-z0-9-]+) -->")
+    HEADER_RE = re.compile(r"^## ", re.MULTILINE)
+
+    # Build a list of (line_index, kind, name, section) for markers outside
+    # fenced code blocks, tracking which ## section each marker lives in.
+    in_fence = False
+    current_section: Optional[str] = None
+    markers: List[Tuple[int, str, str, Optional[str]]] = []  # (line_no, kind, name, section)
+    for line_no, line in enumerate(content.splitlines()):
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        if stripped.startswith("## "):
+            current_section = stripped
+            continue
+        m = MARKER_RE.search(line)
+        if m:
+            markers.append((line_no, m.group(1), m.group(2), current_section))
+
+    ALLOWED_SECTIONS = {"## Current", "## Next"}
+
+    starts: Dict[str, List[Tuple[int, Optional[str]]]] = {}
+    ends: Dict[str, List[Tuple[int, Optional[str]]]] = {}
+    for _ln, kind, name, section in markers:
+        if section not in ALLOWED_SECTIONS:
+            errors.append(
+                f"Malformed stream marker: marker outside ## Current/## Next {suffix} "
+                f"to move it into Current/Next, re-run pause"
+            )
+            # still record it so pairing checks can run
+        if kind == "start":
+            starts.setdefault(name, []).append((_ln, section))
+        else:
+            ends.setdefault(name, []).append((_ln, section))
+
+    # 1. Balanced pairs by name + 2. section-local pairing + 4. non-empty body.
+    matched_ends: set = set()  # (name, end_line_no) consumed
+    # For each start, find a matching end with the same name AFTER it.
+    # Track section membership for the cross-section check.
+    for name, start_list in starts.items():
+        if name not in ends:
+            for _s_ln, _s_sec in start_list:
+                errors.append(
+                    f"Malformed stream marker: start:{name} has no matching end:{name} {suffix} "
+                    f"to pair markers, re-run pause"
+                )
+            continue
+        end_list = ends[name]
+        for s_ln, s_sec in start_list:
+            # Find the earliest unmatched end after this start.
+            match = None
+            for e_entry in end_list:
+                e_ln, e_sec = e_entry
+                if e_ln > s_ln and (name, e_ln) not in matched_ends:
+                    match = e_entry
+                    break
+            if match is None:
+                errors.append(
+                    f"Malformed stream marker: start:{name} has no matching end:{name} {suffix} "
+                    f"to pair markers, re-run pause"
+                )
+                continue
+            e_ln, e_sec = match
+            matched_ends.add((name, e_ln))
+            # Section-local pairing: start and end must be in the SAME section.
+            if s_sec != e_sec:
+                errors.append(
+                    f"Malformed stream marker: start:{name}/end:{name} cross a section boundary {suffix} "
+                    f"to keep the pair inside one section, re-run pause"
+                )
+            # Non-empty body: text between start and end lines (exclusive).
+            lines = content.splitlines()
+            body_lines = lines[s_ln + 1:e_ln]
+            if not "".join(body_lines).strip():
+                errors.append(
+                    f"Malformed stream marker: empty body for start:{name} {suffix} "
+                    f"to add body or remove the pair, re-run pause"
+                )
+
+    # 3. Unique names: no duplicate start:<name>.
+    for name, start_list in starts.items():
+        if len(start_list) > 1:
+            errors.append(
+                f"Malformed stream marker: duplicate start:{name} {suffix} "
+                f"to use unique names, re-run pause"
+            )
+
+    # Orphan ends (end with no matching start) — report as unbalanced.
+    for name, end_list in ends.items():
+        consumed = sum(1 for (n, e_ln) in matched_ends if n == name)
+        if len(end_list) > consumed:
+            errors.append(
+                f"Malformed stream marker: end:{name} has no matching start:{name} {suffix} "
+                f"to pair markers, re-run pause"
+            )
+
+    return errors
+
+
+def _section_body(text: str, header: str) -> str:
+    """Extract section body: text between ## Header and the next ## or EOF.
+
+    Returns "" if the header is absent (does not raise), so module-level callers
+    (archive-stream's emptiness guard, _audit_md) are crash-safe on files missing
+    a section.
+    """
+    try:
+        idx = text.index(header) + len(header)
+    except ValueError:
+        return ""
+    rest = text[idx:]
+    next_marker = re.search(r"\n## ", rest)
+    if next_marker:
+        return rest[:next_marker.start()].strip()
+    return rest.strip()
+
+
+def _validate_md(md_path: Path, task_id: Optional[str] = None) -> List[str]:
     """Validate recovery .md content. Returns list of error messages (empty = valid)."""
     if not md_path.exists():
         return [f"File not found: {md_path}"]
 
     content = md_path.read_text(encoding="utf-8")
 
+    # Marker assertions run on RAW content (before the comment strip below),
+    # because markers are HTML comments and would be stripped away.
+    task_id = task_id or md_path.stem
+    errors = _validate_markers(content, task_id)
+
     # Strip HTML comments before validation so template scaffolding
     # doesn't count toward content minima
     content = re.sub(r"<!--.*?-->", "", content, flags=re.DOTALL)
-
-    errors: List[str] = []
 
     # 5 section headers must all exist
     required_headers = ["## Completed", "## Current", "## Decisions", "## Next", "## Key Files"]
@@ -256,22 +398,16 @@ def _validate_md(md_path: Path) -> List[str]:
     if errors:
         return errors
 
-    # Extract section bodies (text between ## Header and next ## or EOF)
-    def _section_body(text: str, header: str) -> str:
-        idx = text.index(header) + len(header)
-        rest = text[idx:]
-        next_marker = re.search(r"\n## ", rest)
-        if next_marker:
-            return rest[:next_marker.start()].strip()
-        return rest.strip()
-
     completed = _section_body(content, "## Completed")
     current = _section_body(content, "## Current")
     next_ = _section_body(content, "## Next")
 
-    # Completed must have >= 100 non-whitespace chars
+    # Completed is valid if a history pointer line is present OR body >= 100
+    # non-whitespace chars. The pointer (`History: <id>_history.md`) lets a
+    # long task's Completed shrink to a pointer once streams are archived.
     completed_chars = len(re.sub(r"\s+", "", completed))
-    if completed_chars < 100:
+    pointer_present = bool(re.search(r"^History:\s+\S+_history\.md", completed, re.MULTILINE))
+    if not (pointer_present or completed_chars >= 100):
         errors.append(f"## Completed too short: {completed_chars} non-whitespace chars (need >= 100)")
 
     # Current must be non-empty
@@ -283,6 +419,39 @@ def _validate_md(md_path: Path) -> List[str]:
         errors.append("## Next must not be empty")
 
     return errors
+
+
+def _audit_md(md_path: Path) -> List[str]:
+    """Non-blocking bloat warnings for a recovery .md (docs/spec §6).
+
+    Returns a list of warning strings (empty = no warnings). Called ONLY from
+    cmd_pause AFTER _validate_md passes. Warnings are advisory; they never block.
+    """
+    if not md_path.exists():
+        return []
+    content = md_path.read_text(encoding="utf-8")
+    content = re.sub(r"<!--.*?-->", "", content, flags=re.DOTALL)
+
+    task_id = md_path.stem
+    warnings: List[str] = []
+    next_body = _section_body(content, "## Next")
+    current_body = _section_body(content, "## Current")
+
+    next_chars = len(re.sub(r"\s+", "", next_body))
+    if next_chars > 300:
+        warnings.append(
+            f"## Next is {next_chars} chars (guideline ~300). "
+            f"Run archive-stream {task_id} <stream> to fold finished streams."
+        )
+
+    current_chars = len(re.sub(r"\s+", "", current_body))
+    if current_chars > 1200:
+        warnings.append(
+            f"## Current is {current_chars} chars (guideline ~1200). "
+            f"Run archive-stream {task_id} <stream> to fold finished streams."
+        )
+
+    return warnings
 
 
 # ── Source Docs Auto-Scan ────────────────────────────────────────────────────
@@ -529,6 +698,12 @@ def cmd_pause(wf_dir: Path, args: Any) -> None:
             print(f"  - {e}", file=sys.stderr)
         sys.exit(1)
 
+    # Non-blocking bloat warnings (advisory; never block pause).
+    warnings = _audit_md(md_path)
+    if warnings:
+        for w in warnings:
+            print(f"  ! {w}", file=sys.stderr)
+
     # Update record
     now = _now_iso()
     record["updated"] = now
@@ -577,6 +752,8 @@ def cmd_close(wf_dir: Path, args: Any) -> None:
 
     md_path = wf_dir / f"{task_id}.md"
     md_exists = md_path.exists()
+    hist_path = wf_dir / f"{task_id}_history.md"
+    hist_exists = hist_path.exists()
 
     # Dry-run
     if not args.yes:
@@ -595,6 +772,8 @@ def cmd_close(wf_dir: Path, args: Any) -> None:
             print(f"  {md_path} -> {_archived_md_dir(wf_dir) / md_path.name}")
         else:
             print(f"  {md_path} (.md recovery — MISSING)")
+        if hist_exists:
+            print(f"  {hist_path} -> {_archived_md_dir(wf_dir) / hist_path.name}")
         print(f"  workflows.jsonl line -> archive.jsonl (status=closed)")
         print("\n提醒: 如有可复用的技术知识请先通过 memory skill 沉淀。")
         print("\nRun `close <id> --yes` to archive (no deletion).")
@@ -618,6 +797,12 @@ def cmd_close(wf_dir: Path, args: Any) -> None:
     else:
         print(f"  WARNING: .md recovery file not found: {md_path}", file=sys.stderr)
 
+    # 2b. Move <id>_history.md to archived/ if it exists (archive-stream sink).
+    if hist_exists:
+        archived_hist = archived_dir / hist_path.name
+        shutil.move(str(hist_path), str(archived_hist))
+        print(f"  ARCHIVED: {hist_path} -> {archived_hist}")
+
     # 3. Move record from workflows.jsonl to archive.jsonl (with status + closed_at)
     del records[idx]
     _write_jsonl(wf_dir, records)
@@ -630,6 +815,258 @@ def cmd_close(wf_dir: Path, args: Any) -> None:
         print(f"  Source docs kept in place ({len(record['source_docs'])} file(s))")
 
     print(f"Closed {task_id} (archived)")
+
+
+def _resolve_commit_hash(args: Any) -> Optional[str]:
+    """Best-effort short commit hash for an archive-stream summary.
+
+    Returns --commit if provided; else `git rev-parse --short HEAD` in the
+    project root (None for global scope / non-git dir / failure).
+    """
+    if getattr(args, "commit", None):
+        return args.commit
+    project_root = _find_project_root()
+    if project_root is None:
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(project_root),
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip() or None
+    except (subprocess.SubprocessError, OSError):
+        pass
+    return None
+
+
+def cmd_archive_stream(wf_dir: Path, args: Any) -> None:
+    """Fold a finished stream's narrative out of Current/Next into history.
+
+    See docs/spec-archive-stream.md §4.
+    """
+    task_id: str = args.id
+    stream: str = args.stream
+    records = _read_jsonl(wf_dir)
+    idx, record = _find_record(records, task_id)
+    if record is None:
+        # Closed tasks live in archive.jsonl, not workflows.jsonl — do not look
+        # them up. archive-stream operates on pending tasks only.
+        print(f"Task '{task_id}' not found.", file=sys.stderr)
+        sys.exit(1)
+
+    md_path = wf_dir / f"{task_id}.md"
+    if not md_path.exists():
+        print(f"Recovery file not found: {md_path}", file=sys.stderr)
+        sys.exit(1)
+
+    raw = md_path.read_text(encoding="utf-8")
+
+    # ── Resolve span source: named (marker pair) or --range (line range) ──────
+    # Both paths produce (start_idx, end_after, body_lines, label) consumed by the
+    # shared downstream logic (cross-section refusal, summary, guards, dry-run).
+    range_spec = getattr(args, "range", None)
+    if range_spec:
+        # --range mode: 1-indexed inclusive line range, no markers needed.
+        try:
+            s_str, e_str = range_spec.split(":")
+            s, e = int(s_str), int(e_str)
+        except ValueError:
+            print(f"Invalid --range '{range_spec}' (expected <start>:<end>)", file=sys.stderr)
+            sys.exit(1)
+        raw_lines = raw.splitlines()
+        if s < 1 or e > len(raw_lines) or s > e:
+            print(
+                f"Range {s}:{e} out of bounds (file has {len(raw_lines)} lines)",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        def _line_start(lines, lineno_1indexed):
+            return sum(len(lines[j]) + 1 for j in range(lineno_1indexed - 1))
+
+        start_idx = _line_start(raw_lines, s)
+        # end_after = start of line e+1 (includes line e's trailing newline), or
+        # len(raw) if e is the last line. Including the trailing \n avoids leaving
+        # a blank line after deletion (verified by execution).
+        end_after = _line_start(raw_lines, e + 1) if e < len(raw_lines) else len(raw)
+        body_lines = raw_lines[s - 1:e]
+        name_arg = getattr(args, "name", None)
+        if name_arg:
+            label = name_arg
+        else:
+            hist_path_for_count = wf_dir / f"{task_id}_history.md"
+            n = 1
+            if hist_path_for_count.exists():
+                existing = hist_path_for_count.read_text(encoding="utf-8")
+                n = len(re.findall(r"^- range-", existing, re.MULTILINE)) + 1
+            label = f"range-{n}"
+        start_marker = ""  # no marker; span_offset = start_idx
+        stream = None  # range mode has no stream name
+    elif stream:
+        # Named mode: locate marker pair via string search (names are [a-z0-9-]+,
+        # no metachars; string search avoids interpolation risk).
+        start_marker = f"<!-- stream:start:{stream} -->"
+        end_marker = f"<!-- stream:end:{stream} -->"
+        start_idx = raw.find(start_marker)
+        if start_idx == -1:
+            print(f"No stream 'start:{stream}' marker in {task_id}.md", file=sys.stderr)
+            sys.exit(1)
+        end_idx = raw.find(end_marker, start_idx + len(start_marker))
+        if end_idx == -1:
+            print(
+                f"Stream '{stream}' has start but no end marker in {task_id}.md — "
+                f"add the end marker or use a complete pair",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        end_after = end_idx + len(end_marker)
+        body_lines = raw[start_idx + len(start_marker):end_idx].splitlines()
+        label = stream
+    else:
+        print("must specify a stream name or --range", file=sys.stderr)
+        sys.exit(1)
+
+    # ── Shared downstream ────────────────────────────────────────────────────
+    span = raw[start_idx:end_after]
+
+    # Marker-overlap refusal (range mode only): refuse if the span contains a
+    # stream marker from the other mode — mixing leaves unbalanced markers.
+    if range_spec and re.search(r"<!-- stream:", span):
+        print(
+            f"Refusing: range overlaps an existing stream marker — use the named "
+            f"form for marked content, or remove the markers first",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # Defense in depth: refuse cross-section spans (§2.2 assertion 2 blocks these
+    # at pause for markers, but archive-stream checks independently for both modes).
+    if re.search(r"\n## ", span):
+        print(
+            f"Refusing: span for '{label}' crosses a section boundary — "
+            f"split into section-local pairs/ranges first",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # Determine which section the span lives in (for the emptiness guard).
+    preceding = raw[:start_idx]
+    section_headers_before = re.findall(r"^## .+$", preceding, re.MULTILINE)
+    section = section_headers_before[-1].strip() if section_headers_before else None
+
+    # Summary: drop leading blanks; first remaining line, truncated to 120 chars.
+    summary_line = next((ln for ln in body_lines if ln.strip()), f"({label})")
+    summary_text = summary_line.strip()[:120]
+
+    commit_hash = _resolve_commit_hash(args)
+    memory = getattr(args, "memory", None)
+    summary = f"- {label}: {summary_text}"
+    if commit_hash:
+        summary += f" @{commit_hash}"
+    if memory:
+        summary += f" [mem:{memory}]"
+
+    hist_path = wf_dir / f"{task_id}_history.md"
+
+    # Check whether the pointer would need to be added.
+    stripped = re.sub(r"<!--.*?-->", "", raw, flags=re.DOTALL)
+    completed_body = _section_body(stripped, "## Completed")
+    pointer_present = bool(re.search(r"^History:\s+\S+_history\.md", completed_body, re.MULTILINE))
+    pointer_would_add = not pointer_present
+
+    # Active-content guard scan (spec §1): refuse if the span contains active work.
+    # STRONG signals (PAUSED|⏸️) refuse unconditionally; WEAK (TODO|in progress)
+    # refuse unless --force. NO \b boundaries — U+FE0F variation selector on ⏸️
+    # breaks \b after a space, silently missing the pattern (round-1 review blocker).
+    span_text = "\n".join(body_lines)
+    span_offset = (start_idx + len(start_marker)) if stream else start_idx  # for N
+    STRONG_RE = re.compile(r"(PAUSED|⏸️)", re.IGNORECASE)
+    WEAK_RE = re.compile(r"(TODO|in progress)", re.IGNORECASE)
+    strong = STRONG_RE.search(span_text)
+    if strong:
+        n_line = raw[:span_offset + strong.start()].count("\n") + 1
+        print(
+            f"Refusing: span for '{label}' contains active "
+            f"marker '{strong.group()}' at line ~{n_line} — move the active item out "
+            f"of the span before archiving.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    weak = WEAK_RE.search(span_text)
+    if weak and not getattr(args, "force", False):
+        n_line = raw[:span_offset + weak.start()].count("\n") + 1
+        print(
+            f"Refusing: span for '{label}' contains "
+            f"'{weak.group()}' at line ~{n_line} (may be a completed-context mention). "
+            f"Re-run with --force to archive anyway.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if weak and getattr(args, "force", False):
+        print(f"  ! warning: span contains '{weak.group()}' — archiving with --force.", file=sys.stderr)
+
+    run_arg = f"--range {range_spec}" if range_spec else stream  # for dry-run + refuse msgs
+
+    # Dry-run (default): show span edges so an over-broad range/marker is visible.
+    if not args.yes:
+        nonblank = [ln for ln in body_lines if ln.strip()]
+        first_line = (nonblank[0][:80] + "...") if nonblank and len(nonblank[0]) > 80 else (nonblank[0] if nonblank else "(empty)")
+        last_line = (nonblank[-1][:80] + "...") if nonblank and len(nonblank[-1]) > 80 else (nonblank[-1] if nonblank else "(empty)")
+        print(f"Task: {task_id}")
+        print(f"Span: {label}")
+        print(f"\nArchive actions:")
+        print(f"  delete span from {md_path} ({section})")
+        print(f"    first: {first_line}")
+        print(f"    last:  {last_line}")
+        print(f"    {len(body_lines)} lines")
+        print(f"  append to {hist_path}:")
+        print(f"    {summary}")
+        if pointer_would_add:
+            print(f"  add pointer to ## Completed: History: {task_id}_history.md")
+        print(f"\nRun `archive-stream {task_id} {run_arg} --yes` to apply.")
+        return
+
+    # Apply.
+    new_raw = raw[:start_idx] + raw[end_after:]
+
+    # Emptiness guard: would the section the span lived in now be empty?
+    if section in ("## Current", "## Next"):
+        if _section_body(new_raw, section) == "":
+            print(
+                f"Refusing: archiving '{label}' would empty {section}.\n"
+                f"Seed the next step in {section} first (a concrete next action, "
+                f">= 1 line), then re-run: checkpoint archive-stream {task_id} {run_arg}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    # Add the pointer line to ## Completed if not already present.
+    if pointer_would_add:
+        completed_header = "## Completed\n"
+        new_raw = new_raw.replace(
+            completed_header,
+            completed_header + f"History: {task_id}_history.md\n",
+            1,
+        )
+
+    md_path.write_text(new_raw, encoding="utf-8")
+
+    # Lazy-create history file and append the summary.
+    with hist_path.open("a", encoding="utf-8") as fh:
+        fh.write(summary + "\n")
+
+    # Update ONLY record["updated"]; do not touch skill/source_docs.
+    now = _now_iso()
+    record["updated"] = now
+    _write_jsonl(wf_dir, records)
+
+    print(f"Archived stream '{stream}' from {task_id}.md -> {hist_path.name}")
+    print(f"  {summary}")
+    print(f"  updated: {now}")
 
 
 
@@ -659,6 +1096,16 @@ def main() -> None:
     sp.add_argument("id", type=str, help="Task id")
     sp.add_argument("--yes", action="store_true", help="Execute deletion")
 
+    sp = sub.add_parser("archive-stream", help="Fold a finished stream into history")
+    sp.add_argument("id", type=str, help="Task id (yyyyMMdd-HHmmss-slug)")
+    sp.add_argument("stream", nargs="?", type=str, help="Stream name (matches <!-- stream:start:<name> -->)")
+    sp.add_argument("--range", type=str, help="Archive a 1-indexed inclusive line range (legacy cleanup, no markers)")
+    sp.add_argument("--name", type=str, help="Summary label for --range (default: range-N)")
+    sp.add_argument("--memory", type=str, help="Memory slug to reference in the summary line")
+    sp.add_argument("--commit", type=str, help="Commit hash (default: best-effort git HEAD)")
+    sp.add_argument("--force", action="store_true", help="Override WEAK active-content signals (TODO/in progress)")
+    sp.add_argument("--yes", action="store_true", help="Apply (default is dry-run)")
+
     args = p.parse_args()
     if not args.command:
         p.print_help()
@@ -674,5 +1121,7 @@ def main() -> None:
         cmd_pause(wf_dir, args)
     elif args.command == "close":
         cmd_close(wf_dir, args)
+    elif args.command == "archive-stream":
+        cmd_archive_stream(wf_dir, args)
 if __name__ == "__main__":
     main()

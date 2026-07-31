@@ -214,6 +214,25 @@ class TestGenerateMd:
         assert md_path.name == f"{task_id}.md"
         assert md_path.parent == tmp_path
 
+    def test_create_seeds_initial_marker(self, tmp_path):
+        task_id = "20260629-120000-test-task"
+        md_path = checkpoint._generate_md(tmp_path, task_id, "seed note")
+        content = md_path.read_text(encoding="utf-8")
+        assert "<!-- stream:start:initial -->" in content
+        assert "<!-- stream:end:initial -->" in content
+        # The note sits between the markers inside ## Current.
+        current = checkpoint._section_body(
+            re.sub(r"<!--.*?-->", "", content, flags=re.DOTALL), "## Current"
+        )
+        assert "seed note" in current
+        # The seeded markers must be valid (no marker errors). Note: a brand-new
+        # task's ## Completed is template-comment-only (empty after strip), so the
+        # file does NOT pass full _validate_md until the model fills Completed —
+        # that is pre-existing behavior, not a marker issue. Assert only that
+        # marker validation is clean.
+        marker_errors = checkpoint._validate_markers(content, task_id)
+        assert marker_errors == [], marker_errors
+
 
 # ── Unit: _validate_md ───────────────────────────────────────────────────────
 
@@ -273,6 +292,543 @@ class TestValidateMd:
         md_path.write_text(content, encoding="utf-8")
         errors = checkpoint._validate_md(md_path)
         assert any("short" in e.lower() for e in errors)
+
+
+# ── Unit: _section_body (module-level) ───────────────────────────────────────
+
+class TestSectionBody:
+    def test_extracts_body_between_headers(self):
+        text = "## Completed\nbody here\n\n## Current\nother\n"
+        assert checkpoint._section_body(text, "## Completed") == "body here"
+
+    def test_returns_empty_on_missing_header(self):
+        # Must not raise ValueError — module-level callers rely on "".
+        assert checkpoint._section_body("no headers here", "## Current") == ""
+
+    def test_extracts_last_section_to_eof(self):
+        text = "## Key Files\nfile.py\n"
+        assert checkpoint._section_body(text, "## Key Files") == "file.py"
+
+
+# ── Unit: F2 pointer rule (## Completed) ─────────────────────────────────────
+
+class TestF2PointerRule:
+    def _full(self, completed_body: str) -> str:
+        return (
+            "## Completed\n\n" + completed_body + "\n\n"
+            "## Current\nworking\n\n"
+            "## Decisions\n\n"
+            "## Next\nnext step\n\n"
+            "## Key Files\n"
+        )
+
+    def test_pointer_only_completed_passes(self, tmp_path):
+        # Pointer line < 100 chars but pointer present → passes.
+        md_path = tmp_path / "20260730-120000-foo.md"
+        md_path.write_text(self._full("History: 20260730-120000-foo_history.md"), encoding="utf-8")
+        errors = checkpoint._validate_md(md_path)
+        assert not any("Completed" in e for e in errors)
+
+    def test_pointer_regex_anchored(self, tmp_path):
+        # "History of the bug" has no _history.md token → does NOT match pointer.
+        # Combined with < 100 chars → fails.
+        md_path = tmp_path / "task.md"
+        md_path.write_text(self._full("History of the bug: short"), encoding="utf-8")
+        errors = checkpoint._validate_md(md_path)
+        assert any("Completed" in e and ("pointer" in e.lower() or "short" in e.lower()) for e in errors)
+
+    def test_real_summary_100_chars_passes(self, tmp_path):
+        md_path = tmp_path / "task.md"
+        md_path.write_text(self._full("x" * 100), encoding="utf-8")
+        errors = checkpoint._validate_md(md_path)
+        assert not any("Completed" in e for e in errors)
+
+    def test_pointer_with_trailing_comment(self, tmp_path):
+        # No `$` anchor → trailing comment still matches pointer.
+        md_path = tmp_path / "20260730-120000-foo.md"
+        md_path.write_text(
+            self._full("History: 20260730-120000-foo_history.md (see notes)"),
+            encoding="utf-8",
+        )
+        errors = checkpoint._validate_md(md_path)
+        assert not any("Completed" in e for e in errors)
+
+
+# ── Unit: _validate_markers (F3) ─────────────────────────────────────────────
+
+class TestValidateMarkers:
+    TASK_ID = "20260730-120000-foo"
+
+    def _md(self, current_body: str, next_body: str = "next step") -> str:
+        return (
+            "## Completed\n\n" + ("x" * 100) + "\n\n"
+            "## Current\n" + current_body + "\n\n"
+            "## Decisions\n\n"
+            "## Next\n" + next_body + "\n\n"
+            "## Key Files\n"
+        )
+
+    def _errors(self, content: str):
+        return checkpoint._validate_markers(content, self.TASK_ID)
+
+    def test_well_formed_pair_passes(self):
+        body = "<!-- stream:start:initial -->\nfinished work\n<!-- stream:end:initial -->"
+        assert self._errors(self._md(body)) == []
+
+    def test_mismatched_names_caught(self):
+        body = "<!-- stream:start:foo -->\nwork\n<!-- stream:end:bar -->"
+        errs = self._errors(self._md(body))
+        assert any("no matching end:foo" in e for e in errs)
+
+    def test_lone_start_caught(self):
+        body = "<!-- stream:start:foo -->\nwork\n"
+        errs = self._errors(self._md(body))
+        assert any("no matching end:foo" in e for e in errs)
+
+    def test_cross_section_pair_caught(self):
+        # start in Current, end in Next → crosses boundary.
+        content = (
+            "## Completed\n\n" + ("x" * 100) + "\n\n"
+            "## Current\n<!-- stream:start:foo -->\nwork\n\n"
+            "## Decisions\n\n"
+            "## Next\nmore work\n<!-- stream:end:foo -->\n\n"
+            "## Key Files\n"
+        )
+        errs = self._errors(content)
+        assert any("cross a section boundary" in e for e in errs)
+
+    def test_marker_in_decisions_caught(self):
+        content = (
+            "## Completed\n\n" + ("x" * 100) + "\n\n"
+            "## Current\nworking\n\n"
+            "## Decisions\n<!-- stream:start:foo -->\nwork\n<!-- stream:end:foo -->\n\n"
+            "## Next\nnext\n\n"
+            "## Key Files\n"
+        )
+        errs = self._errors(content)
+        assert any("outside ## Current/## Next" in e for e in errs)
+
+    def test_duplicate_name_caught(self):
+        body = (
+            "<!-- stream:start:foo -->\na\n<!-- stream:end:foo -->\n"
+            "<!-- stream:start:foo -->\nb\n<!-- stream:end:foo -->"
+        )
+        errs = self._errors(self._md(body))
+        assert any("duplicate start:foo" in e for e in errs)
+
+    def test_empty_body_caught(self):
+        body = "<!-- stream:start:foo -->\n\n<!-- stream:end:foo -->"
+        errs = self._errors(self._md(body))
+        assert any("empty body for start:foo" in e for e in errs)
+
+    def test_no_markers_passes(self):
+        assert self._errors(self._md("just working")) == []
+
+    def test_marker_in_code_block_ignored(self):
+        body = "```\n<!-- stream:start:foo -->\nwork\n<!-- stream:end:bar -->\n```"
+        # Literal markers inside a code fence are not real markers → no error.
+        assert self._errors(self._md(body)) == []
+
+    def test_missing_close_dashdash_survives(self):
+        # `<!-- stream:start:foo` with no `-->` does not match the marker pattern
+        # → not counted as a marker → no error (harmless literal text).
+        body = "<!-- stream:start:foo\nwork\n"
+        assert self._errors(self._md(body)) == []
+
+
+# ── Unit: archive-stream command ─────────────────────────────────────────────
+
+class TestArchiveStream:
+    TASK_ID = "20260730-120000-foo"
+
+    def _setup(self, tmp_path, current_body, completed_body=None):
+        """Create wf_dir with a workflows.jsonl record and a .md file."""
+        wf_dir = tmp_path / "wf"
+        wf_dir.mkdir()
+        record = _make_valid_record(self.TASK_ID)
+        (wf_dir / "workflows.jsonl").write_text(json.dumps(record) + "\n", encoding="utf-8")
+        completed = completed_body if completed_body is not None else ("x" * 100)
+        md = (
+            "## Completed\n\n" + completed + "\n\n"
+            "## Current\n" + current_body + "\n\n"
+            "## Decisions\n\n"
+            "## Next\nnext step\n\n"
+            "## Key Files\n"
+        )
+        (wf_dir / f"{self.TASK_ID}.md").write_text(md, encoding="utf-8")
+        return wf_dir
+
+    def _args(self, stream, **kw):
+        from argparse import Namespace
+        defaults = {"memory": None, "commit": None, "yes": False, "force": False, "range": None, "name": None}
+        defaults.update(kw)
+        return Namespace(id=self.TASK_ID, stream=stream, **defaults)
+
+    def test_dry_run_no_write(self, tmp_path, capsys):
+        wf = self._setup(tmp_path, "<!-- stream:start:s1 -->\nwork\n<!-- stream:end:s1 -->")
+        before = (wf / f"{self.TASK_ID}.md").read_text()
+        checkpoint.cmd_archive_stream(wf, self._args("s1"))
+        assert (wf / f"{self.TASK_ID}.md").read_text() == before
+        assert not (wf / f"{self.TASK_ID}_history.md").exists()
+        out = capsys.readouterr().out
+        assert "Archive actions:" in out
+        assert "Run `archive-stream" in out
+
+    def test_apply_deletes_body_writes_summary(self, tmp_path, capsys):
+        wf = self._setup(tmp_path, "<!-- stream:start:s1 -->\nfinished diagnostic\n<!-- stream:end:s1 -->\nmore active work")
+        checkpoint.cmd_archive_stream(wf, self._args("s1", yes=True))
+        md = (wf / f"{self.TASK_ID}.md").read_text()
+        assert "finished diagnostic" not in md
+        assert "<!-- stream:start:s1 -->" not in md
+        assert "more active work" in md
+        hist = (wf / f"{self.TASK_ID}_history.md").read_text()
+        assert "- s1: finished diagnostic" in hist
+        assert "History: 20260730-120000-foo_history.md" in md
+
+    def test_pointer_added_when_absent(self, tmp_path):
+        # Completed has real content (>= 100), no pointer → pointer prepended.
+        wf = self._setup(tmp_path, "<!-- stream:start:s1 -->\nwork\n<!-- stream:end:s1 -->\nactive")
+        checkpoint.cmd_archive_stream(wf, self._args("s1", yes=True))
+        md = (wf / f"{self.TASK_ID}.md").read_text()
+        # Pointer is the first line after ## Completed, before the x*100 content.
+        completed = checkpoint._section_body(
+            re.sub(r"<!--.*?-->", "", md, flags=re.DOTALL), "## Completed"
+        )
+        assert completed.startswith("History: 20260730-120000-foo_history.md")
+        assert "x" * 100 in completed  # original content preserved after pointer
+
+    def test_pointer_not_duplicated_when_present(self, tmp_path):
+        wf = self._setup(
+            tmp_path,
+            "<!-- stream:start:s1 -->\nwork\n<!-- stream:end:s1 -->\nactive",
+            completed_body="History: 20260730-120000-foo_history.md",
+        )
+        checkpoint.cmd_archive_stream(wf, self._args("s1", yes=True))
+        md = (wf / f"{self.TASK_ID}.md").read_text()
+        assert md.count("History: 20260730-120000-foo_history.md") == 1
+
+    def test_lazy_history_creation(self, tmp_path):
+        wf = self._setup(tmp_path, "<!-- stream:start:s1 -->\nwork\n<!-- stream:end:s1 -->\nactive")
+        assert not (wf / f"{self.TASK_ID}_history.md").exists()
+        checkpoint.cmd_archive_stream(wf, self._args("s1", yes=True))
+        assert (wf / f"{self.TASK_ID}_history.md").exists()
+
+    def test_empty_section_refusal(self, tmp_path, capsys):
+        # Archiving the ONLY Current content would empty Current → refuse.
+        wf = self._setup(tmp_path, "<!-- stream:start:s1 -->\nonly content\n<!-- stream:end:s1 -->")
+        with pytest.raises(SystemExit):
+            checkpoint.cmd_archive_stream(wf, self._args("s1", yes=True))
+        # File unchanged.
+        assert "only content" in (wf / f"{self.TASK_ID}.md").read_text()
+        assert "would empty ## Current" in capsys.readouterr().err
+
+    def test_cross_section_refusal(self, tmp_path, capsys):
+        content = (
+            "## Completed\n\n" + ("x" * 100) + "\n\n"
+            "## Current\n<!-- stream:start:s1 -->\nwork\n\n"
+            "## Decisions\n\n"
+            "## Next\nmore\n<!-- stream:end:s1 -->\n\n"
+            "## Key Files\n"
+        )
+        wf = tmp_path / "wf"
+        wf.mkdir()
+        record = _make_valid_record(self.TASK_ID)
+        (wf / "workflows.jsonl").write_text(json.dumps(record) + "\n", encoding="utf-8")
+        (wf / f"{self.TASK_ID}.md").write_text(content, encoding="utf-8")
+        with pytest.raises(SystemExit):
+            checkpoint.cmd_archive_stream(wf, self._args("s1", yes=True))
+        assert "crosses a section boundary" in capsys.readouterr().err
+
+    def test_closed_task_not_found(self, tmp_path, capsys):
+        # No record in workflows.jsonl (simulating a closed task in archive.jsonl).
+        wf = tmp_path / "wf"
+        wf.mkdir()
+        (wf / "workflows.jsonl").write_text("", encoding="utf-8")
+        (wf / f"{self.TASK_ID}.md").write_text("## Completed\nx\n", encoding="utf-8")
+        with pytest.raises(SystemExit):
+            checkpoint.cmd_archive_stream(wf, self._args("s1", yes=True))
+        assert "not found" in capsys.readouterr().err
+
+    def test_missing_start_marker_errors(self, tmp_path, capsys):
+        wf = self._setup(tmp_path, "no markers here, just active work")
+        with pytest.raises(SystemExit):
+            checkpoint.cmd_archive_stream(wf, self._args("nonexistent", yes=True))
+        assert "No stream 'start:nonexistent'" in capsys.readouterr().err
+
+    def test_missing_end_marker_errors(self, tmp_path, capsys):
+        wf = self._setup(tmp_path, "<!-- stream:start:s1 -->\nwork\n")
+        with pytest.raises(SystemExit):
+            checkpoint.cmd_archive_stream(wf, self._args("s1", yes=True))
+        assert "no end marker" in capsys.readouterr().err
+
+    def test_memory_and_commit_in_summary(self, tmp_path):
+        wf = self._setup(tmp_path, "<!-- stream:start:s1 -->\nwork\n<!-- stream:end:s1 -->\nactive")
+        checkpoint.cmd_archive_stream(wf, self._args("s1", yes=True, memory="onnx-shape", commit="abc1234"))
+        hist = (wf / f"{self.TASK_ID}_history.md").read_text()
+        assert "[mem:onnx-shape]" in hist
+        assert "@abc1234" in hist
+
+    def test_commit_omitted_global_scope(self, tmp_path):
+        # _find_project_root returns None when CWD is not a project repo (the test
+        # runs under the skill dir, which is skipped). With no --commit and no
+        # project root, the summary omits @<commit>.
+        wf = self._setup(tmp_path, "<!-- stream:start:s1 -->\nwork\n<!-- stream:end:s1 -->\nactive")
+        checkpoint.cmd_archive_stream(wf, self._args("s1", yes=True))
+        hist = (wf / f"{self.TASK_ID}_history.md").read_text()
+        assert "@" not in hist
+
+    def test_nested_pair_deletes_inner(self, tmp_path):
+        body = (
+            "<!-- stream:start:outer -->\nouter body\n"
+            "<!-- stream:start:inner -->\ninner body\n<!-- stream:end:inner -->\n"
+            "<!-- stream:end:outer -->\nactive work"
+        )
+        wf = self._setup(tmp_path, body)
+        checkpoint.cmd_archive_stream(wf, self._args("outer", yes=True))
+        md = (wf / f"{self.TASK_ID}.md").read_text()
+        assert "outer body" not in md
+        assert "inner body" not in md
+        assert "<!-- stream:start:inner -->" not in md
+        assert "active work" in md
+
+    def test_record_updates_only_updated(self, tmp_path):
+        wf = self._setup(tmp_path, "<!-- stream:start:s1 -->\nwork\n<!-- stream:end:s1 -->\nactive")
+        original_updated = json.loads((wf / "workflows.jsonl").read_text())["updated"]
+        original_skill = json.loads((wf / "workflows.jsonl").read_text())["skill"]
+        import time as _time
+        _time.sleep(0.01)
+        checkpoint.cmd_archive_stream(wf, self._args("s1", yes=True))
+        rec = json.loads((wf / "workflows.jsonl").read_text())
+        assert rec["updated"] != original_updated
+        assert rec["skill"] == original_skill
+        assert rec["source_docs"] == []
+
+    # ── Active-content guard scan (Step 2) ────────────────────────────────────
+
+    def test_strong_paused_refuses(self, tmp_path, capsys):
+        wf = self._setup(tmp_path, "<!-- stream:start:s1 -->\n**PAUSED: pending review**\n<!-- stream:end:s1 -->\nactive")
+        with pytest.raises(SystemExit):
+            checkpoint.cmd_archive_stream(wf, self._args("s1", yes=True))
+        assert "active marker" in capsys.readouterr().err
+        assert "PAUSED" in (wf / f"{self.TASK_ID}.md").read_text()  # unchanged
+
+    def test_strong_paused_emoji_refuses(self, tmp_path, capsys):
+        # Regression: ⏸️ (U+23F8 + U+FE0F) must match despite \b issues.
+        wf = self._setup(tmp_path, "<!-- stream:start:s1 -->\nstatus ⏸️ pending\n<!-- stream:end:s1 -->\nactive")
+        with pytest.raises(SystemExit):
+            checkpoint.cmd_archive_stream(wf, self._args("s1", yes=True))
+        assert "active marker" in capsys.readouterr().err
+
+    def test_weak_todo_refuses_without_force(self, tmp_path, capsys):
+        wf = self._setup(tmp_path, "<!-- stream:start:s1 -->\nfixed the TODO handling\n<!-- stream:end:s1 -->\nactive")
+        with pytest.raises(SystemExit):
+            checkpoint.cmd_archive_stream(wf, self._args("s1", yes=True))
+        assert "TODO" in capsys.readouterr().err
+
+    def test_weak_todo_proceeds_with_force(self, tmp_path, capsys):
+        wf = self._setup(tmp_path, "<!-- stream:start:s1 -->\nfixed the TODO handling\n<!-- stream:end:s1 -->\nactive")
+        checkpoint.cmd_archive_stream(wf, self._args("s1", yes=True, force=True))
+        assert "TODO handling" not in (wf / f"{self.TASK_ID}.md").read_text()
+        assert "warning" in capsys.readouterr().err
+
+    def test_no_active_content_archives(self, tmp_path):
+        wf = self._setup(tmp_path, "<!-- stream:start:s1 -->\nstream 9 done, all delivered\n<!-- stream:end:s1 -->\nactive")
+        checkpoint.cmd_archive_stream(wf, self._args("s1", yes=True))
+        assert "stream 9 done" not in (wf / f"{self.TASK_ID}.md").read_text()
+
+    def test_strong_refuse_not_overridden_by_force(self, tmp_path, capsys):
+        wf = self._setup(tmp_path, "<!-- stream:start:s1 -->\n**PAUSED: pending**\n<!-- stream:end:s1 -->\nactive")
+        with pytest.raises(SystemExit):
+            checkpoint.cmd_archive_stream(wf, self._args("s1", yes=True, force=True))
+        assert "PAUSED" in (wf / f"{self.TASK_ID}.md").read_text()  # still there
+
+    # ── --range mode (Step 3) ──────────────────────────────────────────────────
+
+    def _range_args(self, range_spec, **kw):
+        from argparse import Namespace
+        defaults = {"memory": None, "commit": None, "yes": False, "force": False, "name": None}
+        defaults.update(kw)
+        return Namespace(id=self.TASK_ID, stream=None, range=range_spec, **defaults)
+
+    def test_range_deletes_span_writes_summary(self, tmp_path):
+        # Current body has 3 prose lines + a keep line (so Current isn't emptied).
+        wf = self._setup(tmp_path, "prose line one\nprose line two\nprose line three\nkeep this active")
+        md_lines = (wf / f"{self.TASK_ID}.md").read_text().splitlines()
+        start = next(i for i, l in enumerate(md_lines, 1) if l == "prose line one")
+        end = next(i for i, l in enumerate(md_lines, 1) if l == "prose line three")
+        checkpoint.cmd_archive_stream(wf, self._range_args(f"{start}:{end}", yes=True))
+        md = (wf / f"{self.TASK_ID}.md").read_text()
+        assert "prose line one" not in md
+        assert "prose line two" not in md
+        assert "prose line three" not in md
+        assert "keep this active" in md
+        hist = (wf / f"{self.TASK_ID}_history.md").read_text()
+        assert "- range-1: prose line one" in hist
+        assert "History: 20260730-120000-foo_history.md" in md
+
+    def test_range_1_indexed_inclusive(self, tmp_path):
+        wf = self._setup(tmp_path, "keep this\nDELETE ME\nkeep this too")
+        md_lines = (wf / f"{self.TASK_ID}.md").read_text().splitlines()
+        target = next(i for i, l in enumerate(md_lines, 1) if l == "DELETE ME")
+        checkpoint.cmd_archive_stream(wf, self._range_args(f"{target}:{target}", yes=True))
+        md = (wf / f"{self.TASK_ID}.md").read_text()
+        assert "DELETE ME" not in md
+        assert "keep this" in md
+        assert "keep this too" in md
+
+    def test_range_cross_section_refuses(self, tmp_path, capsys):
+        # Range spanning Current→Next crosses ## Decisions.
+        content = (
+            "## Completed\n\n" + ("x" * 100) + "\n\n"
+            "## Current\nstart here\n\n"
+            "## Decisions\n\n"
+            "## Next\nend here\n\n"
+            "## Key Files\n"
+        )
+        wf = tmp_path / "wf"
+        wf.mkdir()
+        record = _make_valid_record(self.TASK_ID)
+        (wf / "workflows.jsonl").write_text(json.dumps(record) + "\n", encoding="utf-8")
+        (wf / f"{self.TASK_ID}.md").write_text(content, encoding="utf-8")
+        md_lines = content.splitlines()
+        s = next(i for i, l in enumerate(md_lines, 1) if l == "start here")
+        e = next(i for i, l in enumerate(md_lines, 1) if l == "end here")
+        with pytest.raises(SystemExit):
+            checkpoint.cmd_archive_stream(wf, self._range_args(f"{s}:{e}", yes=True))
+        assert "crosses a section boundary" in capsys.readouterr().err
+
+    def test_range_empty_section_refuses(self, tmp_path, capsys):
+        # Current has only one line; archiving it empties Current.
+        wf = self._setup(tmp_path, "only current line")
+        md_lines = (wf / f"{self.TASK_ID}.md").read_text().splitlines()
+        target = next(i for i, l in enumerate(md_lines, 1) if l == "only current line")
+        with pytest.raises(SystemExit):
+            checkpoint.cmd_archive_stream(wf, self._range_args(f"{target}:{target}", yes=True))
+        assert "would empty" in capsys.readouterr().err
+
+    def test_range_marker_overlap_refuses(self, tmp_path, capsys):
+        wf = self._setup(tmp_path, "<!-- stream:start:s1 -->\nwork\n<!-- stream:end:s1 -->\nactive")
+        md_lines = (wf / f"{self.TASK_ID}.md").read_text().splitlines()
+        s = next(i for i, l in enumerate(md_lines, 1) if "stream:start" in l)
+        e = next(i for i, l in enumerate(md_lines, 1) if "stream:end" in l)
+        with pytest.raises(SystemExit):
+            checkpoint.cmd_archive_stream(wf, self._range_args(f"{s}:{e}", yes=True))
+        assert "overlaps an existing stream marker" in capsys.readouterr().err
+
+    def test_range_default_name(self, tmp_path):
+        wf = self._setup(tmp_path, "first prose\nsecond prose\nkeep")
+        md_lines = (wf / f"{self.TASK_ID}.md").read_text().splitlines()
+        s = next(i for i, l in enumerate(md_lines, 1) if l == "first prose")
+        e = next(i for i, l in enumerate(md_lines, 1) if l == "second prose")
+        checkpoint.cmd_archive_stream(wf, self._range_args(f"{s}:{e}", yes=True))
+        assert "- range-1: first prose" in (wf / f"{self.TASK_ID}_history.md").read_text()
+
+    def test_range_named(self, tmp_path):
+        wf = self._setup(tmp_path, "first prose\nkeep")
+        md_lines = (wf / f"{self.TASK_ID}.md").read_text().splitlines()
+        s = next(i for i, l in enumerate(md_lines, 1) if l == "first prose")
+        checkpoint.cmd_archive_stream(wf, self._range_args(f"{s}:{s}", yes=True, name="custom-name"))
+        assert "- custom-name: first prose" in (wf / f"{self.TASK_ID}_history.md").read_text()
+
+    def test_range_dry_run_shows_span_edges(self, tmp_path, capsys):
+        wf = self._setup(tmp_path, "first prose\nmiddle\nlast prose\nkeep")
+        md_lines = (wf / f"{self.TASK_ID}.md").read_text().splitlines()
+        s = next(i for i, l in enumerate(md_lines, 1) if l == "first prose")
+        e = next(i for i, l in enumerate(md_lines, 1) if l == "last prose")
+        checkpoint.cmd_archive_stream(wf, self._range_args(f"{s}:{e}"))
+        out = capsys.readouterr().out
+        assert "first:" in out and "first prose" in out
+        assert "last:" in out and "last prose" in out
+        assert "lines" in out
+        assert not (wf / f"{self.TASK_ID}_history.md").exists()  # no write
+
+    def test_range_neither_stream_nor_range_errors(self, tmp_path, capsys):
+        wf = self._setup(tmp_path, "some content")
+        from argparse import Namespace
+        args = Namespace(id=self.TASK_ID, stream=None, range=None, memory=None, commit=None, yes=True, force=False, name=None)
+        with pytest.raises(SystemExit):
+            checkpoint.cmd_archive_stream(wf, args)
+        assert "must specify" in capsys.readouterr().err
+
+    def test_range_active_content_refuses(self, tmp_path, capsys):
+        wf = self._setup(tmp_path, "done work\n**PAUSED: pending**\nmore\nkeep")
+        md_lines = (wf / f"{self.TASK_ID}.md").read_text().splitlines()
+        s = next(i for i, l in enumerate(md_lines, 1) if l == "done work")
+        e = next(i for i, l in enumerate(md_lines, 1) if l == "more")
+        with pytest.raises(SystemExit):
+            checkpoint.cmd_archive_stream(wf, self._range_args(f"{s}:{e}", yes=True))
+        assert "active marker" in capsys.readouterr().err
+
+    # ── Dry-run enhancement (Step 4) ───────────────────────────────────────────
+
+    def test_dry_run_shows_first_last_count(self, tmp_path, capsys):
+        wf = self._setup(tmp_path, "<!-- stream:start:s1 -->\nfirst line\nmiddle\nlast line\n<!-- stream:end:s1 -->\nactive")
+        checkpoint.cmd_archive_stream(wf, self._args("s1"))
+        out = capsys.readouterr().out
+        assert "first:" in out and "first line" in out
+        assert "last:" in out and "last line" in out
+        assert "lines" in out
+
+    def test_dry_run_single_line_span(self, tmp_path, capsys):
+        wf = self._setup(tmp_path, "<!-- stream:start:s1 -->\nsolo line\n<!-- stream:end:s1 -->\nactive")
+        checkpoint.cmd_archive_stream(wf, self._args("s1"))
+        out = capsys.readouterr().out
+        assert "first:" in out and "solo line" in out
+        assert "last:" in out and "solo line" in out  # first==last
+
+
+# ── Unit: _audit_md (non-blocking warnings) ──────────────────────────────────
+
+class TestAuditMd:
+    TASK_ID = "20260730-120000-foo"
+
+    def _md_path(self, tmp_path, current_body, next_body="next step"):
+        md = (
+            "## Completed\n\n" + ("x" * 100) + "\n\n"
+            "## Current\n" + current_body + "\n\n"
+            "## Decisions\n\n"
+            "## Next\n" + next_body + "\n\n"
+            "## Key Files\n"
+        )
+        md_path = tmp_path / f"{self.TASK_ID}.md"
+        md_path.write_text(md, encoding="utf-8")
+        return md_path
+
+    def test_next_over_threshold_warns(self, tmp_path):
+        long_next = "x" * 400
+        md_path = self._md_path(tmp_path, "active", next_body=long_next)
+        warnings = checkpoint._audit_md(md_path)
+        assert any("## Next is" in w and "300" in w for w in warnings)
+
+    def test_current_over_threshold_warns(self, tmp_path):
+        long_current = "x" * 1300
+        md_path = self._md_path(tmp_path, long_current)
+        warnings = checkpoint._audit_md(md_path)
+        assert any("## Current is" in w and "1200" in w for w in warnings)
+
+    def test_current_under_threshold_no_warn(self, tmp_path):
+        md_path = self._md_path(tmp_path, "small active state")
+        warnings = checkpoint._audit_md(md_path)
+        assert warnings == []
+
+    def test_warning_non_blocking(self, tmp_path):
+        # Via cmd_pause: warnings print to stderr but pause still succeeds.
+        with tempfile.TemporaryDirectory() as td:
+            result = _run("create", "Audit Test", "--note", "n", scope_dir=td)
+            task_id = result.stdout.strip().split("\n")[0].split()[-1]
+            long_next = "x" * 400
+            content = (
+                "## Completed\n\n" + ("x" * 100) + "\n\n"
+                "## Current\nworking\n\n"
+                "## Decisions\n\n"
+                "## Next\n" + long_next + "\n\n"
+                "## Key Files\n"
+            )
+            (Path(td) / f"{task_id}.md").write_text(content, encoding="utf-8")
+            result = _run("pause", task_id, scope_dir=td)
+            assert result.returncode == 0  # non-blocking
+            assert "## Next is" in result.stderr
+            assert "Paused" in result.stdout
 
 
 # ── Unit: _alpha_tokens ──────────────────────────────────────────────────────
@@ -548,6 +1104,75 @@ class TestCliClose:
             assert archive[0]["id"] == task_id
             assert archive[0]["status"] == "closed"
             assert "closed_at" in archive[0]
+
+    def test_close_moves_history(self):
+        with tempfile.TemporaryDirectory() as td:
+            result = _run("create", "Hist Close", "--note", "note", scope_dir=td)
+            task_id = result.stdout.strip().split("\n")[0].split()[-1]
+            content = (
+                "## Completed\n\n" + ("x" * 100) + "\n\n"
+                "## Current\n<!-- stream:start:s1 -->\nwork\n<!-- stream:end:s1 -->\nactive\n\n"
+                "## Decisions\n\n"
+                "## Next\nrun tests\n\n"
+                "## Key Files\n"
+            )
+            (Path(td) / f"{task_id}.md").write_text(content, encoding="utf-8")
+            # Archive a stream so a history file is created.
+            assert _run("archive-stream", task_id, "s1", "--yes", scope_dir=td).returncode == 0
+            hist_path = Path(td) / f"{task_id}_history.md"
+            assert hist_path.exists()
+
+            # Fill Completed so close --yes passes validation.
+            md = (Path(td) / f"{task_id}.md").read_text(encoding="utf-8")
+            md = md.replace("## Completed\n\n", "## Completed\n\n" + ("x" * 100) + "\n\n", 1)
+            (Path(td) / f"{task_id}.md").write_text(md, encoding="utf-8")
+
+            result = _run("close", task_id, "--yes", scope_dir=td)
+            assert result.returncode == 0
+            assert not hist_path.exists()  # moved out of wf dir
+            archived_hist = Path(td) / "archived" / f"{task_id}_history.md"
+            assert archived_hist.exists()
+            archived_md = Path(td) / "archived" / f"{task_id}.md"
+            assert archived_md.exists()
+
+    def test_close_dry_run_lists_history(self):
+        with tempfile.TemporaryDirectory() as td:
+            result = _run("create", "Hist Dry", "--note", "note", scope_dir=td)
+            task_id = result.stdout.strip().split("\n")[0].split()[-1]
+            content = (
+                "## Completed\n\n" + ("x" * 100) + "\n\n"
+                "## Current\n<!-- stream:start:s1 -->\nwork\n<!-- stream:end:s1 -->\nactive\n\n"
+                "## Decisions\n\n"
+                "## Next\nrun tests\n\n"
+                "## Key Files\n"
+            )
+            (Path(td) / f"{task_id}.md").write_text(content, encoding="utf-8")
+            assert _run("archive-stream", task_id, "s1", "--yes", scope_dir=td).returncode == 0
+
+            result = _run("close", task_id, scope_dir=td)
+            assert result.returncode == 0
+            assert "_history.md" in result.stdout
+            assert "Archive actions" in result.stdout
+
+    def test_close_no_history_no_change(self):
+        with tempfile.TemporaryDirectory() as td:
+            result = _run("create", "No Hist", "--note", "note", scope_dir=td)
+            task_id = result.stdout.strip().split("\n")[0].split()[-1]
+            content = (
+                "## Completed\n\n" + ("x" * 100) + "\n\n"
+                "## Current\nworking\n\n"
+                "## Decisions\n\n"
+                "## Next\nrun tests\n\n"
+                "## Key Files\n"
+            )
+            (Path(td) / f"{task_id}.md").write_text(content, encoding="utf-8")
+            assert not (Path(td) / f"{task_id}_history.md").exists()
+
+            result = _run("close", task_id, "--yes", scope_dir=td)
+            assert result.returncode == 0
+            # No history file was ever created; close behaves as before.
+            assert not (Path(td) / "archived" / f"{task_id}_history.md").exists()
+            assert (Path(td) / "archived" / f"{task_id}.md").exists()
 
     def test_list_closed_shows_archived(self):
         with tempfile.TemporaryDirectory() as td:
