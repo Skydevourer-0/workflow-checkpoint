@@ -12,6 +12,7 @@ Use --scope-dir <path> to override (for testing).
 """
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -23,42 +24,94 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 HOME = Path.home()
 
+# Data root (SSOT layout shared with memory-lifecycle):
+#   ~/.cc-switch/workflows/global/           (no project .git found)
+#   ~/.cc-switch/workflows/projects/<slug>/  (project .git found)
+WORKFLOWS_ROOT = HOME / ".cc-switch" / "workflows"
+
+# Path-boundary special cases: dotfiles/skill roots, never a project scope.
+CLAUDE_DIR = (HOME / ".claude").resolve()
+CC_SWITCH_SKILLS = (HOME / ".cc-switch" / "skills").resolve()
+
 RED = "\033[91m"
 YELLOW = "\033[93m"
 RESET = "\033[0m"
 
-# ── slugify_project_key (shared with cc-workflow / archived-memory-lifecycle) ──
+# Hook additionalContext budget (shared spec with memory-lifecycle HOTLIST).
+HOOK_BUDGET = 1200
 
-def slugify_project_key(project_key: str) -> str:
-    value = project_key.strip()
-    if not value:
-        raise ValueError("project_key must not be empty")
-    return "-" + re.sub(r"[^A-Za-z0-9]+", "-", value).strip("-")
+
+# ── Slug (unified spec, shared with memory-lifecycle) ───────────────────────
+
+def project_slug(path: Union[str, Path]) -> str:
+    """Project slug: realpath -> lowercase -> non-[a-z0-9] -> '-' -> collapse.
+
+    Shared spec with memory-lifecycle (no leading dash, lowercase):
+      C:\\Users\\a\\proj  ->  c-users-a-proj
+    """
+    value = os.path.realpath(str(path)).lower()
+    value = re.sub(r"[^a-z0-9]", "-", value)
+    value = re.sub(r"-+", "-", value)
+    return value
 
 
 # ── Scope ───────────────────────────────────────────────────────────────────
 
-def detect_scope_dir() -> Path:
-    """Walk up from CWD looking for .git. Return workflows directory.
-    .git in $HOME or ~/.claude/ is ignored (dotfiles, skill repos)."""
-    claude = (HOME / ".claude").resolve()
-    scope_dir = Path.cwd().resolve()
-    home = HOME.resolve()
+def _is_within(child: Path, parent: Path) -> bool:
+    """Boundary-safe containment: True when child == parent or under parent."""
+    child_s = os.path.normcase(str(child))
+    parent_s = os.path.normcase(str(parent))
+    if child_s == parent_s:
+        return True
+    return child_s.startswith(parent_s.rstrip("/\\") + os.sep)
 
+
+def _is_global_path(probe: Path) -> bool:
+    """Global-scope roots: $HOME, ~/.claude/, ~/.cc-switch/skills/ (boundaries)."""
+    return (
+        os.path.normcase(str(probe)) == os.path.normcase(str(HOME))
+        or _is_within(probe, CLAUDE_DIR)
+        or _is_within(probe, CC_SWITCH_SKILLS)
+    )
+
+
+def _has_git_marker(path: Path) -> bool:
+    """True when path/.git is a git dir, or a gitdir-pointer file
+    (worktree/submodule). The pointer target must exist."""
+    git_path = path / ".git"
+    if git_path.is_dir():
+        return True
+    if git_path.is_file():
+        try:
+            content = git_path.read_text(encoding="utf-8")
+        except OSError:
+            return False
+        m = re.search(r"(?m)^gitdir:\s*(.+?)\s*$", content)
+        if not m:
+            return False
+        target = Path(m.group(1))
+        if not target.is_absolute():
+            target = path / target
+        return target.exists()
+    return False
+
+
+def detect_scope_dir() -> Path:
+    """Walk up from CWD looking for a project git root. Return workflows dir.
+
+    Global scope: no project .git found, or inside $HOME / ~/.claude/ /
+    ~/.cc-switch/skills/ (dotfiles, skill repos). Project scope: nearest git
+    root — .git dir or worktree/submodule .git file.
+    """
+    probe = Path.cwd().resolve()
     while True:
-        if (scope_dir / ".git").exists():
-            if scope_dir == home:
-                pass  # dotfiles repo at $HOME
-            elif scope_dir == claude or claude in scope_dir.parents:
-                pass  # inside ~/.claude/ — skill repo, not a project
-            else:
-                slug = slugify_project_key(str(scope_dir))
-                return HOME / ".claude" / "projects" / slug / "workflows"
-        parent = scope_dir.parent
-        if parent == scope_dir:
+        if _has_git_marker(probe) and not _is_global_path(probe):
+            return WORKFLOWS_ROOT / "projects" / project_slug(probe)
+        parent = probe.parent
+        if parent == probe:
             break  # reached filesystem root
-        scope_dir = parent
-    return HOME / ".claude" / "global" / "workflows"
+        probe = parent
+    return WORKFLOWS_ROOT / "global"
 
 
 def _resolve(args: Any) -> Path:
@@ -68,19 +121,12 @@ def _resolve(args: Any) -> Path:
 
 
 def _find_project_root() -> Optional[Path]:
-    """Find the nearest git root, respecting the same guard rules as
-    detect_scope_dir. Returns None for global scope (no valid project git)."""
-    claude = (HOME / ".claude").resolve()
-    home = HOME.resolve()
+    """Nearest git root (dir or worktree .git file), same guard rules as
+    detect_scope_dir. Returns None for global scope."""
     probe = Path.cwd().resolve()
     while True:
-        if (probe / ".git").exists():
-            if probe == home:
-                pass  # dotfiles repo at $HOME
-            elif probe == claude or claude in probe.parents:
-                pass  # inside ~/.claude/ — skill repo
-            else:
-                return probe
+        if _has_git_marker(probe) and not _is_global_path(probe):
+            return probe
         parent = probe.parent
         if parent == probe:
             break
@@ -605,6 +651,8 @@ def cmd_list(wf_dir: Path, args: Any) -> None:
             age = round(h)
             parts.append(f"{r['id']} ({r['title']}, {age}d)")
         ctx = f"{len(records)} pending task(s): " + ", ".join(parts) + "."
+        if len(ctx) > HOOK_BUDGET:
+            ctx = ctx[:HOOK_BUDGET]
         output = {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": ctx}}
         print(json.dumps(output))
         return
@@ -1112,6 +1160,20 @@ def main() -> None:
         return
 
     wf_dir = _resolve(args)
+
+    if args.command == "list" and getattr(args, "hook", False):
+        # Hook mode: force UTF-8 stdout + fail-open (any error -> stderr,
+        # empty stdout, exit 0) so a corrupt store never breaks the session.
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError, OSError):
+            pass
+        try:
+            cmd_list(wf_dir, args)
+        except Exception as exc:
+            print(f"checkpoint hook error: {exc}", file=sys.stderr)
+            return
+        return
 
     if args.command == "list":
         cmd_list(wf_dir, args)

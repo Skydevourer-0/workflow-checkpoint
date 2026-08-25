@@ -8,7 +8,7 @@ description: Use when tracking tasks, pausing/resuming work across sessions, che
 JSONL flat-file task checkpoint. Script owns all writes; model only edits `.md` recovery files.
 Scope is auto-detected from CWD. Use `--scope-dir <path>` only for testing.
 
-Let `CP` = `$HOME/.claude/skills/workflow-checkpoint/scripts/checkpoint.py`
+Let `CP` = `$HOME/.cc-switch/skills/workflow-checkpoint/scripts/checkpoint.py`
 
 ## Commands
 
@@ -31,7 +31,7 @@ python3 $CP close <id> [--yes]
 
 **Pause/save progress:**
 1. Identify the task id (from `list` or context)
-2. Edit `~/.claude/{global|projects/<slug>}/workflows/<id>.md` — replace each `<!-- comment -->` with real content
+2. Edit `~/.cc-switch/workflows/{global|projects/<slug>}/<id>.md` — replace each `<!-- comment -->` with real content
 3. `pause <id> [--source-docs <paths>] [--skill <name>]`
    - `--source-docs`: comma-separated paths to add to auto-scanned results
    - `--skill`: skill name to load on resume
@@ -49,8 +49,8 @@ python3 $CP close <id> [--yes]
 3. The marker pair and its body are DELETED from the `.md`; a one-line summary is appended to `<id>_history.md`, and a pointer `History: <id>_history.md` is added to `## Completed`. The active `.md` shrinks.
 - `--memory <slug>`: references a memory name in the summary line (optional; sediment reusable knowledge via the memory skill first).
 - `--commit <sha>`: defaults to best-effort `git rev-parse --short HEAD` in the project root (omitted for global scope / non-git).
-- `--force`: overrides WEAK active-content signals (`TODO`/`in progress` in the span). STRONG signals (`PAUSED`/`⏸️`) always refuse — they unambiguously mark pending work. Use `--force` only when a completed narrative legitimately contains "TODO" (e.g. "fixed the TODO handling").
-- **Active-content guard:** before archiving, the span is scanned for `PAUSED`/`⏸️` (refuse) and `TODO`/`in progress` (refuse unless `--force`). This prevents a pending item from being silently swept into an archived span.
+- `--force`: overrides WEAK active-content signals (`TODO`/`in progress` in the span). STRONG signals (`PAUSED`) always refuse — they unambiguously mark pending work. Use `--force` only when a completed narrative legitimately contains "TODO" (e.g. "fixed the TODO handling").
+- **Active-content guard:** before archiving, the span is scanned for `PAUSED` (refuse) and `TODO`/`in progress` (refuse unless `--force`). This prevents a pending item from being silently swept into an archived span. The script also reads the legacy pause-button marker for compatibility; new documents use `PAUSED`.
 - Refuses if archiving would empty `## Current`/`## Next` (seed the next step first) or if a pair crosses a section boundary.
 - A stream whose narrative spans BOTH Current and Next (separated by `## Decisions`) must be archived as TWO calls (one per section), because cross-section pairs are forbidden.
 
@@ -63,28 +63,28 @@ python3 $CP close <id> [--yes]
 - **Forward work should still use markers** — a marker name is a stable handle across edits (line numbers drift as the file is edited; a marker resolves by name regardless). Use `--range` only for unmarked legacy cleanup, not as the forward default.
 - Batch: for many `--range` calls, loop in shell (`for r in 12:47 50:61; do ...; done`).
 
-**Resume a task:** Read `~/.claude/{global|projects/<slug>}/workflows/<id>.md` directly. Load `skill` if non-null. Start from `## Next`. Optional completed-stream context lives in `<id>_history.md` (pointer in `## Completed`).
+**Resume a task:** Read `~/.cc-switch/workflows/{global|projects/<slug>}/<id>.md` directly. Load `skill` if non-null. Start from `## Next`. Optional completed-stream context lives in `<id>_history.md` (pointer in `## Completed`).
 
 **Close a task:** `close <id>` (dry-run, shows what will be archived) → if knowledge worth keeping, archive first via memory skill → `close <id> --yes` (validates .md same as pause, then archives). Closing does NOT delete: the record moves from `workflows.jsonl` to `archive.jsonl` (with `status=closed` + `closed_at`), the `.md` moves to an `archived/` subdirectory, and `source_docs` are kept in place. Recover with `list --closed` or by reading `archived/<id>.md` directly. The `<id>` keeps its `yyyyMMdd-HHmmss-<slug>` name, so archived work stays retrievable by date or topic via `find`.
 
 **Retrieve closed work:**
 - `list --closed` — lists archived tasks. Output format: `Archived tasks (N)` header, then one line per task: `<id> — <title>  (closed YYYY-MM-DD)`, sorted most-recently-closed first. Duplicate ids (from manual-edit corruption) are deduped automatically.
-- By date: `find ~/.claude/{global,projects/*/}/workflows/archived/ -name "202607*.md"` (all July 2026 work).
-- By topic: `find ~/.claude/{global,projects/*/}/workflows/archived/ -name "*thor-stage1*.md"`.
-- Read a specific task: `~/.claude/{global|projects/<slug>}/workflows/archived/<id>.md`.
+- By date: `find ~/.cc-switch/workflows/{global,projects/*/}/archived/ -name "202607*.md"` (all July 2026 work).
+- By topic: `find ~/.cc-switch/workflows/{global,projects/*/}/archived/ -name "*thor-stage1*.md"`.
+- Read a specific task: `~/.cc-switch/workflows/{global|projects/<slug>}/archived/<id>.md`.
 
 **Archiving vs memory:** Closing archives the *work record* (what was done, decisions, files) for traceability — it does NOT extract reusable technical knowledge. If the task produced a reusable conclusion (a debugging lesson, an operator finding, a cross-session engineering insight), sink it via the memory skill *before* `close --yes`. The archive is a log; memory is the knowledge base.
 
 ## Storage
 
 ```
-~/.claude/global/workflows/<id>.md          (no .git found)
-~/.claude/projects/<slug>/workflows/<id>.md (project .git found)
-~/.claude/{...}/workflows/<id>_history.md  (archived-stream summaries — created by archive-stream, lazy)
-~/.claude/{...}/workflows/workflows.jsonl   (pending tasks — script-owned, NEVER touch)
-~/.claude/{...}/workflows/archive.jsonl     (closed tasks — script-owned, NEVER touch)
-~/.claude/{...}/workflows/archived/<id>.md  (closed-task recovery files)
-~/.claude/{...}/workflows/archived/<id>_history.md  (moved alongside on close)
+~/.cc-switch/workflows/global/<id>.md          (no project .git found)
+~/.cc-switch/workflows/projects/<slug>/<id>.md (project .git found)
+~/.cc-switch/workflows/{global|projects/<slug>}/<id>_history.md  (archived-stream summaries — created by archive-stream, lazy)
+~/.cc-switch/workflows/{global|projects/<slug>}/workflows.jsonl  (pending tasks — script-owned, NEVER touch)
+~/.cc-switch/workflows/{global|projects/<slug>}/archive.jsonl    (closed tasks — script-owned, NEVER touch)
+~/.cc-switch/workflows/{global|projects/<slug>}/archived/<id>.md  (closed-task recovery files)
+~/.cc-switch/workflows/{global|projects/<slug>}/archived/<id>_history.md  (moved alongside on close)
 ```
 
 ## .md Template
@@ -121,8 +121,32 @@ At `create` and `pause`, the script auto-scans for related documents:
 Dual filter: mtime within task time window + filename slug tokens overlap with task title.
 Candidates shown on stdout; model can pass `--source-docs` to add paths manually.
 
-## Setup
+## Platforms
+
+Data and commands are identical on Claude Code and Codex (same files, same
+scripts). Install the SessionStart hook per platform:
+
+**Claude Code** (writes `~/.claude/settings.json`, matcher `startup|resume|clear|compact`):
 
 ```bash
-python3 $CP/../install.py
+python ~/.cc-switch/skills/workflow-checkpoint/.claude/install.py
 ```
+
+**Codex** (writes `$CODEX_HOME/hooks.json`, default `~/.codex/hooks.json`):
+
+```bash
+python ~/.cc-switch/skills/workflow-checkpoint/.codex/install.py
+```
+
+Then run `/hooks` in a Codex session and approve the workflow-checkpoint
+SessionStart hook. After any reinstall, re-approve — Codex trusts hooks by
+command hash, and the path changes with the skill location.
+
+`scripts/install.py` remains as a legacy compatibility entry that detects the
+environment and forwards to the matching installer.
+
+The hook is inject-only and non-blocking: on session start it emits pending
+tasks as `additionalContext` (truncated to 1200 chars) and always exits 0. On
+Codex, `/clear` re-triggers the SessionStart hook (matcher includes `clear`),
+so pending tasks are re-injected; the memory skill's global `AGENTS.md` hotlist
+resumes on the next startup.

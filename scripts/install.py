@@ -1,74 +1,49 @@
 #!/usr/bin/env python3
-"""Cross-platform installer for workflow-checkpoint SessionStart hook.
+"""Legacy compatibility entry — detects the target environment and forwards.
 
-    python install.py             # install
-    python install.py --dry-run   # preview only
+    python scripts/install.py              # auto: Claude Code or Codex installer
+    python scripts/install.py --dry-run    # preview only
 
-Registers a direct python command in ~/.claude/settings.json.
-No generated .ps1/.sh scripts, no CLAUDE.md injection.
+Forwards to .claude/install.py when ~/.claude/settings.json exists, else to
+.codex/install.py when the Codex home exists, else prints usage.
+New installs should call the per-platform installer directly:
+  Claude Code:  python <skill>/.claude/install.py
+  Codex:        python <skill>/.codex/install.py
 """
 
-import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
-HOME = Path.home()
-SETTINGS = HOME / ".claude" / "settings.json"
-CHECKPOINT = HOME / ".claude" / "skills" / "workflow-checkpoint" / "scripts" / "checkpoint.py"
-PYTHON = sys.executable  # the Python running right now — zero search needed
+SKILL_DIR = Path(__file__).resolve().parent.parent
 
 
-def main():
-    dry_run = "--dry-run" in sys.argv
+def _home_dir() -> Path:
+    env_home = os.environ.get("HOME")
+    return Path(env_home) if env_home else Path.home()
 
-    cmd = f'"{PYTHON}" "{CHECKPOINT}" list --hook'
 
-    hook_json = {
-        "type": "command",
-        "async": False,
-        "command": cmd,
-    }
+def _codex_home() -> Path:
+    env = os.environ.get("CODEX_HOME")
+    return Path(env) if env else _home_dir() / ".codex"
 
-    if dry_run:
-        print(f"Python:      {PYTHON}")
-        print(f"Checkpoint:  {CHECKPOINT}")
-        print(f"Hook cmd:    {cmd}")
-        print(f"Settings:    {SETTINGS}")
-        print()
-        print("[DRY-RUN] Run without --dry-run to install.")
+
+def main() -> None:
+    args = sys.argv[1:]
+
+    if (_home_dir() / ".claude" / "settings.json").exists():
+        target = SKILL_DIR / ".claude" / "install.py"
+    elif _codex_home().exists():
+        target = SKILL_DIR / ".codex" / "install.py"
+    else:
+        print("No target environment detected.")
+        print("  Claude Code:  python <skill>/.claude/install.py")
+        print("  Codex:        python <skill>/.codex/install.py")
         return
 
-    if not SETTINGS.exists():
-        print(f"settings.json not found at {SETTINGS}. Run Claude Code once first.")
-        sys.exit(1)
-
-    cfg = json.loads(SETTINGS.read_text(encoding="utf-8"))
-
-    # Register SessionStart hook
-    session_hooks = cfg.setdefault("hooks", {}).setdefault("SessionStart", [])
-
-    # Remove any previous workflow-checkpoint hook from the first entry
-    if session_hooks:
-        entry = session_hooks[0]
-        hooks_list = entry.setdefault("hooks", [])
-        existing = [h for h in hooks_list if "workflow-checkpoint" in h.get("command", "")]
-        for h in existing:
-            hooks_list.remove(h)
-
-    # Add new hook
-    if session_hooks:
-        session_hooks[0].setdefault("hooks", []).append(hook_json)
-    else:
-        session_hooks.append({
-            "matcher": "startup|clear|compact",
-            "hooks": [hook_json],
-        })
-
-    SETTINGS.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
-
-    print("Installed.")
-    print(f"  Hook: {cmd}")
-    print(f"  Settings: {SETTINGS}")
+    result = subprocess.run([sys.executable, str(target), *args])
+    sys.exit(result.returncode)
 
 
 if __name__ == "__main__":

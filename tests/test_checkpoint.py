@@ -43,33 +43,90 @@ def _make_valid_record(task_id="20260629-120000-test-task", title="Test Task"):
     }
 
 
-# ── Unit: slugify_project_key ────────────────────────────────────────────────
+# ── Unit: project_slug (unified spec, shared with memory-lifecycle) ──────────
 
-class TestSlugifyProjectKey:
-    def test_normal_path(self):
-        result = checkpoint.slugify_project_key("/home/user/my-project")
-        assert result.startswith("-")
-        assert "my-project" in result
-        assert not result.endswith(" ")
+class TestProjectSlug:
+    def test_windows_path_vector(self):
+        # Cross-skill vector: must equal memory-lifecycle's slug for the same path.
+        assert checkpoint.project_slug(r"C:\Users\a\proj") == "c-users-a-proj"
 
-    def test_empty_string_raises(self):
-        with pytest.raises(ValueError, match="must not be empty"):
-            checkpoint.slugify_project_key("")
+    def test_lowercases(self):
+        assert checkpoint.project_slug("C:/Users/Alice/Project") == "c-users-alice-project"
 
-    def test_whitespace_only_raises(self):
-        with pytest.raises(ValueError, match="must not be empty"):
-            checkpoint.slugify_project_key("   ")
+    def test_collapses_separators(self):
+        # Underscores are non-[a-z0-9] and collapse into a single dash.
+        assert checkpoint.project_slug("C:/Users/a/My__Project") == "c-users-a-my-project"
 
     def test_special_chars(self):
-        result = checkpoint.slugify_project_key("My Project (2024)!")
-        # Should become something like "-My-Project-2024-"
+        result = checkpoint.project_slug("C:/Users/a/My Project (2024)!")
         assert "(" not in result
         assert ")" not in result
         assert "!" not in result
+        assert " " not in result
 
-    def test_leading_trailing_special_chars(self):
-        result = checkpoint.slugify_project_key("---hello---")
-        assert result == "-hello"
+    def test_matches_slug_re(self):
+        result = checkpoint.project_slug("C:/Users/张三/项目")
+        assert re.fullmatch(r"[a-z0-9-]+", result)
+
+
+# ── Unit: scope detection ────────────────────────────────────────────────────
+
+class TestScopeDetection:
+    def _patch_globals(self, monkeypatch, tmp_path):
+        fake_home = tmp_path / "home"
+        claude = fake_home / ".claude"
+        skills = fake_home / ".cc-switch" / "skills"
+        workflows = fake_home / ".cc-switch" / "workflows"
+        monkeypatch.setattr(checkpoint, "HOME", fake_home)
+        monkeypatch.setattr(checkpoint, "CLAUDE_DIR", claude)
+        monkeypatch.setattr(checkpoint, "CC_SWITCH_SKILLS", skills)
+        monkeypatch.setattr(checkpoint, "WORKFLOWS_ROOT", workflows)
+        return claude, skills, workflows
+
+    def test_skills_dir_is_global(self, tmp_path, monkeypatch):
+        _, skills, workflows = self._patch_globals(monkeypatch, tmp_path)
+        proj = skills / "some-skill"
+        proj.mkdir(parents=True)
+        (proj / ".git").mkdir()
+        monkeypatch.chdir(proj)
+        assert checkpoint.detect_scope_dir() == workflows / "global"
+        assert checkpoint._find_project_root() is None
+
+    def test_claude_dir_is_global(self, tmp_path, monkeypatch):
+        claude, _, workflows = self._patch_globals(monkeypatch, tmp_path)
+        proj = claude / "projects" / "x"
+        proj.mkdir(parents=True)
+        (proj / ".git").mkdir()
+        monkeypatch.chdir(proj)
+        assert checkpoint.detect_scope_dir() == workflows / "global"
+
+    def test_project_root_uses_new_slug(self, tmp_path, monkeypatch):
+        _, _, workflows = self._patch_globals(monkeypatch, tmp_path)
+        proj = tmp_path / "My Proj"
+        proj.mkdir()
+        (proj / ".git").mkdir()
+        monkeypatch.chdir(proj)
+        expected = workflows / "projects" / checkpoint.project_slug(proj)
+        assert checkpoint.detect_scope_dir() == expected
+        assert checkpoint._find_project_root() == proj.resolve()
+
+    def test_git_file_worktree_is_project_root(self, tmp_path, monkeypatch):
+        main_git = tmp_path / "main" / ".git"
+        main_git.mkdir(parents=True)
+        wt = tmp_path / "worktree"
+        wt.mkdir()
+        (wt / ".git").write_text(f"gitdir: {main_git}\n", encoding="utf-8")
+        monkeypatch.chdir(wt)
+        assert checkpoint._has_git_marker(wt) is True
+        assert checkpoint._find_project_root() == wt.resolve()
+
+    def test_git_file_with_missing_gitdir_not_project(self, tmp_path, monkeypatch):
+        wt = tmp_path / "broken-wt"
+        wt.mkdir()
+        (wt / ".git").write_text("gitdir: C:/does/not/exist\n", encoding="utf-8")
+        monkeypatch.chdir(wt)
+        assert checkpoint._has_git_marker(wt) is False
+        assert checkpoint._find_project_root() is None
 
 
 # ── Unit: _title_to_slug ─────────────────────────────────────────────────────
@@ -968,6 +1025,31 @@ class TestCliListHook:
             assert "hookSpecificOutput" in output
             assert output["hookSpecificOutput"]["hookEventName"] == "SessionStart"
             assert output["hookSpecificOutput"]["additionalContext"] == ""
+
+    def test_hook_truncated_to_budget(self):
+        with tempfile.TemporaryDirectory() as td:
+            records = [
+                _make_valid_record(
+                    f"20260629-12000{i}-task-{i}",
+                    f"Task {i} " + "x" * 200,
+                )
+                for i in range(20)
+            ]
+            checkpoint._write_jsonl(Path(td), records)
+            result = _run("list", "--hook", scope_dir=td)
+            output = json.loads(result.stdout)
+            ctx = output["hookSpecificOutput"]["additionalContext"]
+            assert len(ctx) <= checkpoint.HOOK_BUDGET
+            assert ctx.startswith("20 pending task(s):")
+
+    def test_hook_fail_open_on_corrupt_jsonl(self):
+        # Fail-open: any error -> stderr, empty stdout, exit 0.
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "workflows.jsonl").write_text("{bad json\n", encoding="utf-8")
+            result = _run("list", "--hook", scope_dir=td)
+            assert result.returncode == 0
+            assert result.stdout.strip() == ""
+            assert "checkpoint hook error" in result.stderr
 
 
 class TestCliCreateAndList:

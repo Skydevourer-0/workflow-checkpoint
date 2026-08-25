@@ -15,16 +15,23 @@ Claude Code 在 session 之间会丢失任务状态。下一个 session 不记�
 
 ## 安装
 
+数据与命令在 Claude Code / Codex 双端一致，安装器分端注册 SessionStart hook：
+
+**Claude Code**（写 `~/.claude/settings.json`，matcher `startup|resume|clear|compact`）：
+
 ```bash
-python3 ~/.claude/skills/workflow-checkpoint/scripts/install.py
+python ~/.cc-switch/skills/workflow-checkpoint/.claude/install.py
 ```
 
-只在 `~/.claude/settings.json` 中注册一个 SessionStart hook：
-```
-python3 ~/.claude/skills/workflow-checkpoint/scripts/checkpoint.py list --hook
+**Codex**（写 `$CODEX_HOME/hooks.json`，默认 `~/.codex/hooks.json`）：
+
+```bash
+python ~/.cc-switch/skills/workflow-checkpoint/.codex/install.py
 ```
 
-可以用 `--dry-run` 预览注册内容，不实际修改。
+然后在 Codex 会话中运行 `/hooks` 批准 workflow-checkpoint SessionStart hook；重装后需重新批准（hook 按命令哈希 trust）。`scripts/install.py` 是兼容旧入口，自动检测环境转发。均支持 `--dry-run` 预览。
+
+Hook 只注入不阻断：会话启动时把待办任务作为 `additionalContext` 输出（截断至 1200 字符），始终 exit 0。Codex `/clear` 会重新触发 SessionStart hook（matcher 含 `clear`），待办会重新注入。
 
 ## 使用
 
@@ -32,26 +39,26 @@ Scope 自动检测，不需要手动指定 `--global` / `--project`。脚本从�
 
 ```bash
 # 查看待办（按热度排序，>=7天黄 >=14天红）
-python3 ~/.claude/skills/workflow-checkpoint/scripts/checkpoint.py list
+python3 ~/.cc-switch/skills/workflow-checkpoint/scripts/checkpoint.py list
 
 # SessionStart hook 输出（供 settings.json 中注册的 hook 调用）
-python3 ~/.claude/skills/workflow-checkpoint/scripts/checkpoint.py list --hook
+python3 ~/.cc-switch/skills/workflow-checkpoint/scripts/checkpoint.py list --hook
 
 # 创建新任务（--note 必填，自动生成 id + .md 模板 + 扫描关联文档）
-python3 ~/.claude/skills/workflow-checkpoint/scripts/checkpoint.py create "任务标题" --note "上下文：因何而起、要做什么"
+python3 ~/.cc-switch/skills/workflow-checkpoint/scripts/checkpoint.py create "任务标题" --note "上下文：因何而起、要做什么"
 
 # 暂停/保存进度（校验 .md 内容后刷新时间戳；超长段落会打印非阻塞告警）
-python3 ~/.claude/skills/workflow-checkpoint/scripts/checkpoint.py pause <id> [--source-docs <路径>] [--skill <名称>]
+python3 ~/.cc-switch/skills/workflow-checkpoint/scripts/checkpoint.py pause <id> [--source-docs <路径>] [--skill <名称>]
 
 # 折叠完成的子流（dry-run 预览）
-python3 ~/.claude/skills/workflow-checkpoint/scripts/checkpoint.py archive-stream <id> <stream>
+python3 ~/.cc-switch/skills/workflow-checkpoint/scripts/checkpoint.py archive-stream <id> <stream>
 # 确认折叠（删除标记正文 → 写一行摘要进 <id>_history.md → ## Completed 加指针）
-python3 ~/.claude/skills/workflow-checkpoint/scripts/checkpoint.py archive-stream <id> <stream> --yes
+python3 ~/.cc-switch/skills/workflow-checkpoint/scripts/checkpoint.py archive-stream <id> <stream> --yes
 
 # 关闭任务（dry-run 预览归档范围）
-python3 ~/.claude/skills/workflow-checkpoint/scripts/checkpoint.py close <id>
+python3 ~/.cc-switch/skills/workflow-checkpoint/scripts/checkpoint.py close <id>
 # 确认关闭（校验 .md → 归档 .md + <id>_history.md 到 archived/，记录移入 archive.jsonl）
-python3 ~/.claude/skills/workflow-checkpoint/scripts/checkpoint.py close <id> --yes
+python3 ~/.cc-switch/skills/workflow-checkpoint/scripts/checkpoint.py close <id> --yes
 ```
 
 ### 流标记（archive-stream 用）
@@ -81,8 +88,8 @@ python3 ~/.claude/skills/workflow-checkpoint/scripts/checkpoint.py close <id> --
 ## 存储结构
 
 ```
-~/.claude/global/workflows/             （全局 scope，未找到 .git）
-~/.claude/projects/<slug>/workflows/    （项目 scope，找到 .git）
+~/.cc-switch/workflows/global/          （全局 scope，未找到 .git 或位于 ~/.claude/、~/.cc-switch/skills/）
+~/.cc-switch/workflows/projects/<slug>/ （项目 scope，找到 .git）
 ├── workflows.jsonl                     ← 脚本独占写入，模型绝不直接操作
 ├── 20260629-100510-compare-skills.md   ← 模型编辑的恢复上下文
 ├── 20260629-100510-compare-skills_history.md  ← archive-stream 写的流摘要（懒创建）
@@ -113,10 +120,12 @@ Create → 工作中 → Pause（模型编辑 .md → 脚本校验 → 写入 JS
 |------|------|
 | `SKILL.md` | Skill 定义 + 模型行为规则 |
 | `scripts/checkpoint.py` | 命令行工具：list / create / pause / archive-stream / close + JSONL 读写 + 源文档扫描 |
-| `scripts/install.py` | SessionStart hook 安装器（直接注册 python 命令，不生成中间脚本） |
+| `.claude/install.py` | Claude Code 安装器：写 `~/.claude/settings.json` SessionStart hook |
+| `.codex/install.py` | Codex 安装器：写 `$CODEX_HOME/hooks.json` SessionStart hook |
+| `scripts/install.py` | 兼容旧入口：检测环境并转发到上述安装器 |
 | `scripts/migrate_v2.py` | 一次性迁移工具：v2 子目录格式 → v3 平面文件 |
 
 ## 依赖
 
 - Python 3.8+（仅标准库：`json`、`pathlib`、`argparse`、`datetime`、`re`、`shutil`、`subprocess`）
-- Claude Code（使用 SessionStart hook）
+- Claude Code / Codex（双端 SessionStart hook，数据与命令一致）
