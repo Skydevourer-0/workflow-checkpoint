@@ -46,17 +46,21 @@ def _make_valid_record(task_id="20260629-120000-test-task", title="Test Task"):
 # ── Unit: project_slug (unified spec, shared with memory-lifecycle) ──────────
 
 class TestProjectSlug:
+    @pytest.mark.skipif(os.name != "nt", reason="Windows path semantics only on Windows")
     def test_windows_path_vector(self):
         # Cross-skill vector: must equal memory-lifecycle's slug for the same path.
         assert checkpoint.project_slug(r"C:\Users\a\proj") == "c-users-a-proj"
 
+    @pytest.mark.skipif(os.name != "nt", reason="Windows path semantics only on Windows")
     def test_lowercases(self):
         assert checkpoint.project_slug("C:/Users/Alice/Project") == "c-users-alice-project"
 
+    @pytest.mark.skipif(os.name != "nt", reason="Windows path semantics only on Windows")
     def test_collapses_separators(self):
         # Underscores are non-[a-z0-9] and collapse into a single dash.
         assert checkpoint.project_slug("C:/Users/a/My__Project") == "c-users-a-my-project"
 
+    @pytest.mark.skipif(os.name != "nt", reason="Windows path semantics only on Windows")
     def test_special_chars(self):
         result = checkpoint.project_slug("C:/Users/a/My Project (2024)!")
         assert "(" not in result
@@ -533,7 +537,12 @@ class TestArchiveStream:
 
     def test_apply_deletes_body_writes_summary(self, tmp_path, capsys):
         wf = self._setup(tmp_path, "<!-- stream:start:s1 -->\nfinished diagnostic\n<!-- stream:end:s1 -->\nmore active work")
-        checkpoint.cmd_archive_stream(wf, self._args("s1", yes=True))
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(tmp_path)  # non-git dir -> no project root (WSL-safe)
+            checkpoint.cmd_archive_stream(wf, self._args("s1", yes=True))
+        finally:
+            os.chdir(old_cwd)
         md = (wf / f"{self.TASK_ID}.md").read_text()
         assert "finished diagnostic" not in md
         assert "<!-- stream:start:s1 -->" not in md
@@ -545,7 +554,12 @@ class TestArchiveStream:
     def test_pointer_added_when_absent(self, tmp_path):
         # Completed has real content (>= 100), no pointer → pointer prepended.
         wf = self._setup(tmp_path, "<!-- stream:start:s1 -->\nwork\n<!-- stream:end:s1 -->\nactive")
-        checkpoint.cmd_archive_stream(wf, self._args("s1", yes=True))
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(tmp_path)  # non-git dir -> no project root (WSL-safe)
+            checkpoint.cmd_archive_stream(wf, self._args("s1", yes=True))
+        finally:
+            os.chdir(old_cwd)
         md = (wf / f"{self.TASK_ID}.md").read_text()
         # Pointer is the first line after ## Completed, before the x*100 content.
         completed = checkpoint._section_body(
@@ -560,14 +574,24 @@ class TestArchiveStream:
             "<!-- stream:start:s1 -->\nwork\n<!-- stream:end:s1 -->\nactive",
             completed_body="History: 20260730-120000-foo_history.md",
         )
-        checkpoint.cmd_archive_stream(wf, self._args("s1", yes=True))
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(tmp_path)  # non-git dir -> no project root (WSL-safe)
+            checkpoint.cmd_archive_stream(wf, self._args("s1", yes=True))
+        finally:
+            os.chdir(old_cwd)
         md = (wf / f"{self.TASK_ID}.md").read_text()
         assert md.count("History: 20260730-120000-foo_history.md") == 1
 
     def test_lazy_history_creation(self, tmp_path):
         wf = self._setup(tmp_path, "<!-- stream:start:s1 -->\nwork\n<!-- stream:end:s1 -->\nactive")
         assert not (wf / f"{self.TASK_ID}_history.md").exists()
-        checkpoint.cmd_archive_stream(wf, self._args("s1", yes=True))
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(tmp_path)  # non-git dir -> no project root (WSL-safe)
+            checkpoint.cmd_archive_stream(wf, self._args("s1", yes=True))
+        finally:
+            os.chdir(old_cwd)
         assert (wf / f"{self.TASK_ID}_history.md").exists()
 
     def test_empty_section_refusal(self, tmp_path, capsys):
@@ -630,7 +654,12 @@ class TestArchiveStream:
         # runs under the skill dir, which is skipped). With no --commit and no
         # project root, the summary omits @<commit>.
         wf = self._setup(tmp_path, "<!-- stream:start:s1 -->\nwork\n<!-- stream:end:s1 -->\nactive")
-        checkpoint.cmd_archive_stream(wf, self._args("s1", yes=True))
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(tmp_path)  # non-git dir -> no project root (WSL-safe)
+            checkpoint.cmd_archive_stream(wf, self._args("s1", yes=True))
+        finally:
+            os.chdir(old_cwd)
         hist = (wf / f"{self.TASK_ID}_history.md").read_text()
         assert "@" not in hist
 
@@ -654,7 +683,12 @@ class TestArchiveStream:
         original_skill = json.loads((wf / "workflows.jsonl").read_text())["skill"]
         import time as _time
         _time.sleep(0.01)
-        checkpoint.cmd_archive_stream(wf, self._args("s1", yes=True))
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(tmp_path)  # non-git dir -> no project root (WSL-safe)
+            checkpoint.cmd_archive_stream(wf, self._args("s1", yes=True))
+        finally:
+            os.chdir(old_cwd)
         rec = json.loads((wf / "workflows.jsonl").read_text())
         assert rec["updated"] != original_updated
         assert rec["skill"] == original_skill
@@ -690,7 +724,12 @@ class TestArchiveStream:
 
     def test_no_active_content_archives(self, tmp_path):
         wf = self._setup(tmp_path, "<!-- stream:start:s1 -->\nstream 9 done, all delivered\n<!-- stream:end:s1 -->\nactive")
-        checkpoint.cmd_archive_stream(wf, self._args("s1", yes=True))
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(tmp_path)  # non-git dir -> no project root (WSL-safe)
+            checkpoint.cmd_archive_stream(wf, self._args("s1", yes=True))
+        finally:
+            os.chdir(old_cwd)
         assert "stream 9 done" not in (wf / f"{self.TASK_ID}.md").read_text()
 
     def test_strong_refuse_not_overridden_by_force(self, tmp_path, capsys):
@@ -1323,4 +1362,6 @@ class TestCliClose:
 
             # source doc must still exist (not deleted)
             assert doc.exists(), "source doc should be kept after close"
+
+
 

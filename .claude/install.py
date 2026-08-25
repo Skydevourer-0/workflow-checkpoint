@@ -29,22 +29,28 @@ def _settings_path() -> Path:
     return _home_dir() / ".claude" / "settings.json"
 
 
-def _hook_command() -> str:
-    return _fmt_cmd(PYTHON, str(CHECKPOINT), "list", "--hook")
+def _hook() -> dict:
+    """Claude Code hook in exec (args) form: `command` is spawned directly
+    with the argument list, never through a shell. On Windows a plain
+    command string runs through Git Bash, which strips backslashes
+    (D:\\scoop\\... -> D:scoop...), so Windows paths must never reach a
+    shell parser. Args form also removes the need for quoting entirely."""
+    return {
+        "type": "command",
+        "async": False,
+        "command": PYTHON,
+        "args": [str(CHECKPOINT), "list", "--hook"],
+    }
 
 
-def _fmt_cmd(python_exe: str, script: str, *args: str) -> str:
-    """Build a hook command. Quote a path only when it contains spaces:
-    Windows cmd / CreateProcess fails when the executable name itself is
-    quoted (e.g. Codex hooks), while a quoted path with spaces works on
-    Claude Code. Unquoted paths work everywhere."""
-    def _q(p: str) -> str:
-        return f'"{p}"' if " " in p else p
-    return " ".join([_q(python_exe), _q(script), *args])
+def _hook_payload(hook: dict) -> str:
+    """Flatten command + args of a hook for matching. Handles both the new
+    exec-form hooks and legacy command-string hooks."""
+    return " ".join([hook.get("command", ""), *(hook.get("args") or [])])
 
 
-def _is_ours(command: str) -> bool:
-    return SKILL_NAME in command
+def _is_ours(hook: dict) -> bool:
+    return SKILL_NAME in _hook_payload(hook)
 
 
 def _write_json_atomic(path: Path, cfg: dict) -> None:
@@ -58,23 +64,19 @@ def _clean_session_hooks(session_hooks: list) -> None:
     """Remove this skill's hooks from every SessionStart group; drop emptied groups."""
     for group in session_hooks:
         group["hooks"] = [
-            h for h in group.get("hooks", []) if not _is_ours(h.get("command", ""))
+            h for h in group.get("hooks", []) if not _is_ours(h)
         ]
     session_hooks[:] = [g for g in session_hooks if g.get("hooks")]
 
 
 def main() -> None:
     dry_run = "--dry-run" in sys.argv
-    hook_json = {
-        "type": "command",
-        "async": False,
-        "command": _hook_command(),
-    }
+    hook_json = _hook()
 
     if dry_run:
         print(f"Python:      {PYTHON}")
         print(f"Checkpoint:  {CHECKPOINT}")
-        print(f"Hook cmd:    {_hook_command()}")
+        print(f"Hook cmd:    {_hook_payload(hook_json)}")
         print(f"Settings:    {_settings_path()}")
         print()
         print("[DRY-RUN] Run without --dry-run to install.")
@@ -98,7 +100,7 @@ def main() -> None:
     _write_json_atomic(settings, cfg)
 
     print("Installed.")
-    print(f"  Hook: {_hook_command()}")
+    print(f"  Hook: {_hook_payload(hook_json)}")
     print(f"  Settings: {settings}")
 
 

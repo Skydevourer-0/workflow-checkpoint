@@ -49,12 +49,15 @@ def _create_settings(home_dir: Path, content: dict = None):
 
 
 def _wc_hooks(cfg):
-    """All SessionStart hooks whose command mentions workflow-checkpoint."""
+    """All SessionStart hooks whose flattened command+args mention
+    workflow-checkpoint (handles exec-form hooks and legacy command strings)."""
+    def _flat(h):
+        return " ".join([h.get("command", ""), *(h.get("args") or [])])
     return [
         h
         for group in cfg.get("hooks", {}).get("SessionStart", [])
         for h in group.get("hooks", [])
-        if "workflow-checkpoint" in h.get("command", "")
+        if "workflow-checkpoint" in _flat(h)
     ]
 
 
@@ -75,14 +78,15 @@ class TestClaudeInstaller:
         hook_list = entry["hooks"]
         assert len(hook_list) >= 1
 
-        hook_cmd = hook_list[0].get("command", "")
-        assert "workflow-checkpoint" in hook_cmd
-        assert "checkpoint.py" in hook_cmd
-        assert "list --hook" in hook_cmd
-        # Windows cmd/CreateProcess fails when the executable name is quoted
-        # (Codex hooks). Paths without spaces must stay unquoted.
-        if " " not in sys.executable and " " not in str(Path(__file__).resolve()):
-            assert not hook_cmd.startswith('"')
+        hook = hook_list[0]
+        # exec (args) form: `command` is the interpreter, script + args follow
+        # in `args`. Never a shell command string (Git Bash strips backslashes).
+        assert hook.get("type") == "command"
+        assert hook.get("async") is False
+        assert hook.get("command") == sys.executable
+        args = hook.get("args") or []
+        assert any("workflow-checkpoint" in a and "checkpoint.py" in a for a in args)
+        assert "list" in args and "--hook" in args
 
     def test_install_creates_settings_if_missing(self, tmp_path):
         # New installer semantics: idempotent init — creates settings.json.
