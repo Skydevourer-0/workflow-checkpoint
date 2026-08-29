@@ -123,7 +123,7 @@ Candidates shown on stdout; model can pass `--source-docs` to add paths manually
 
 ## Platforms
 
-Data and commands are identical on Claude Code and Codex (same files, same
+Data and commands are identical on Claude Code, Codex, and ZCode (same files, same
 scripts). Install the SessionStart hook per platform:
 
 **Claude Code** (writes `~/.claude/settings.json`, matcher `startup|resume|clear|compact`):
@@ -142,11 +142,23 @@ Then run `/hooks` in a Codex session and approve the workflow-checkpoint
 SessionStart hook. After any reinstall, re-approve — Codex trusts hooks by
 command hash, and the path changes with the skill location.
 
+**ZCode** (writes `~/.zcode/cli/config.json` → `hooks.enabled: true` +
+`hooks.events.SessionStart`, same matcher):
+
+```bash
+python ~/.cc-switch/skills/workflow-checkpoint/.zcode/install.py
+```
+
+No `/hooks` approval needed (unlike Codex) — configuration-file hooks run once
+`hooks.enabled: true`. The entry uses `type: "process"` (args vector, no shell):
+ZCode's `type: "command"` accepts no `args` field and drops mixed-field hooks.
+Hook runs (fired/outcome/duration) are recorded in the ZCode log.
+
 `scripts/install.py` remains as a legacy compatibility entry that detects the
 environment and forwards to the matching installer.
 
 The hook is inject-only and non-blocking: on session start it emits pending
 tasks as `additionalContext` (truncated to 1200 chars) and always exits 0. On
-Codex, `/clear` re-triggers the SessionStart hook (matcher includes `clear`),
-so pending tasks are re-injected; the memory skill's global `AGENTS.md` hotlist
-resumes on the next startup.
+Codex and ZCode, `/clear` re-triggers the SessionStart hook (matcher includes
+`clear`), so pending tasks are re-injected; the memory skill's global
+`AGENTS.md` hotlist resumes on the next startup.
