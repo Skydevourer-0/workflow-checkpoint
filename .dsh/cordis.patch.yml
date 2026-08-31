@@ -1,0 +1,4 @@
+# dsh bundle patch: register the workflow-checkpoint native hook plugin.
+- insert:
+    - id: workflow-checkpoint-dsh
+      name: 'workflow-checkpoint-dsh'
