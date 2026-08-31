@@ -19,6 +19,7 @@ python3 $CP pause <id> [--source-docs <path,...>] [--skill <name>]
 python3 $CP archive-stream <id> <stream> [--memory <slug>] [--commit <sha>] [--force] [--yes]
 python3 $CP archive-stream <id> --range <start>:<end> [--name <name>] [--memory <slug>] [--commit <sha>] [--force] [--yes]
 python3 $CP close <id> [--yes]
+python3 $CP link <id> <target-id> [--type blocks|depends-on|related]
 ```
 
 `list` flags are mutually exclusive in effect: `--closed` lists archived tasks (text); `--hook` emits SessionStart JSON for pending tasks. If both are passed, `--closed` wins and emits text — the SessionStart hook is configured with `--hook` only (see `install.py`), so this never triggers in practice.

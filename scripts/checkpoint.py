@@ -668,7 +668,10 @@ def cmd_list(wf_dir: Path, args: Any) -> None:
     for r, h in entries:
         c = _color(h)
         age = round(h)
+        rels = r.get("relations", [])
         line = f"  {r['id']} — {r['title']}  (heat={h}, {age}d)"
+        if rels:
+            line += "  [" + ", ".join(f"{x['to']}({x['type']})" for x in rels) + "]"
         if c:
             line = c + line + RESET
         print(line)
@@ -709,6 +712,7 @@ def cmd_create(wf_dir: Path, args: Any) -> None:
         "updated": now,
         "skill": None,
         "source_docs": [],
+        "relations": [],
     }
 
     records.append(record)
@@ -727,6 +731,34 @@ def cmd_create(wf_dir: Path, args: Any) -> None:
             print(f"    {c}")
     else:
         print(f"  source-doc candidates: (none)")
+
+
+VALID_RELATION_TYPES = ("blocks", "depends-on", "related")
+
+
+def cmd_link(wf_dir: Path, args: Any) -> None:
+    """Create a typed relation between two tasks (mnemon-style typed edges)."""
+    task_id: str = args.id
+    target_id: str = args.target
+    rel_type: str = args.type
+    records = _read_jsonl(wf_dir)
+    _, record = _find_record(records, task_id)
+    if record is None:
+        print(f"Task '{task_id}' not found.", file=sys.stderr)
+        sys.exit(1)
+    if target_id == task_id:
+        print("Self-relation not allowed.", file=sys.stderr)
+        sys.exit(1)
+    _, target = _find_record(records, target_id)
+    if target is None:
+        print(f"Target task '{target_id}' not found.", file=sys.stderr)
+        sys.exit(1)
+    relations = record.get("relations", [])
+    relations = [r for r in relations if not (r.get("to") == target_id and r.get("type") == rel_type)]
+    relations.append({"to": target_id, "type": rel_type})
+    record["relations"] = relations
+    _write_jsonl(wf_dir, records)
+    print(f"Linked {task_id} -[{rel_type}]-> {target_id}")
 
 
 def cmd_pause(wf_dir: Path, args: Any) -> None:
@@ -1154,6 +1186,11 @@ def main() -> None:
     sp.add_argument("--force", action="store_true", help="Override WEAK active-content signals (TODO/in progress)")
     sp.add_argument("--yes", action="store_true", help="Apply (default is dry-run)")
 
+    sp = sub.add_parser("link", help="Create a typed relation between two tasks")
+    sp.add_argument("id", type=str, help="Source task id")
+    sp.add_argument("target", type=str, help="Target task id")
+    sp.add_argument("--type", type=str, default="related", choices=list(VALID_RELATION_TYPES), help="Relation type")
+
     args = p.parse_args()
     if not args.command:
         p.print_help()
@@ -1185,5 +1222,7 @@ def main() -> None:
         cmd_close(wf_dir, args)
     elif args.command == "archive-stream":
         cmd_archive_stream(wf_dir, args)
+    elif args.command == "link":
+        cmd_link(wf_dir, args)
 if __name__ == "__main__":
     main()

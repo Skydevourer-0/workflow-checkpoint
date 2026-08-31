@@ -1122,6 +1122,44 @@ class TestCliCreateDuplicate:
                 assert records[0]["id"] != records[1]["id"]
 
 
+class TestCliLink:
+    def test_link_and_list(self):
+        with tempfile.TemporaryDirectory() as td:
+            _run("create", "Task A", "--note", "Task A note", scope_dir=td)
+            _run("create", "Task B", "--note", "Task B note", scope_dir=td)
+            records = checkpoint._read_jsonl(Path(td))
+            a = records[0]["id"]
+            b = records[1]["id"]
+
+            result = _run("link", a, b, "--type", "blocks", scope_dir=td)
+            assert "Linked" in result.stdout
+
+            records = checkpoint._read_jsonl(Path(td))
+            a_rec = next(r for r in records if r["id"] == a)
+            assert a_rec["relations"] == [{"to": b, "type": "blocks"}]
+
+            result = _run("list", scope_dir=td)
+            assert f"{b}(blocks)" in result.stdout
+
+    def test_link_invalid_type(self):
+        with tempfile.TemporaryDirectory() as td:
+            _run("create", "Task A", "--note", "Task A note", scope_dir=td)
+            _run("create", "Task B", "--note", "Task B note", scope_dir=td)
+            records = checkpoint._read_jsonl(Path(td))
+            a, b = records[0]["id"], records[1]["id"]
+            result = _run("link", a, b, "--type", "bogus", scope_dir=td)
+            assert result.returncode != 0
+
+    def test_link_self_not_allowed(self):
+        with tempfile.TemporaryDirectory() as td:
+            _run("create", "Task A", "--note", "Task A note", scope_dir=td)
+            records = checkpoint._read_jsonl(Path(td))
+            a = records[0]["id"]
+            result = _run("link", a, a, scope_dir=td)
+            assert result.returncode != 0
+            assert "Self-relation" in result.stderr
+
+
 class TestCliPauseValidation:
     def test_pause_validation_fails(self):
         with tempfile.TemporaryDirectory() as td:
