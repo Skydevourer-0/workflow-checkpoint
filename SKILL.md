@@ -120,6 +120,11 @@ python3 $CP ledger list [--theme <tag>]
 分组 / `--json`）；`ledger list` 看原始条目。`report`/`ledger` 默认聚合所有 scope，
 加 `--scope-dir` 只看单目录（测试用）。
 
+**In DSH, prefer the tools for reads:** running inside DeepSeek Harness, read the ledger
+via the `checkpoint_report` / `checkpoint_ledger` tools (they aggregate all scopes and need
+no shell) instead of shelling out. `distill` and the lifecycle commands remain shell-driven
+(`python3 $CP ...`) because they resolve scope from the session cwd.
+
 ## Storage
 
 ```
