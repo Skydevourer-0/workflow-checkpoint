@@ -20,6 +20,9 @@ python3 $CP archive-stream <id> <stream> [--memory <slug>] [--commit <sha>] [--f
 python3 $CP archive-stream <id> --range <start>:<end> [--name <name>] [--memory <slug>] [--commit <sha>] [--force] [--yes]
 python3 $CP close <id> [--yes]
 python3 $CP link <id> <target-id> [--type blocks|depends-on|related]
+python3 $CP distill <id> <stream> [--commit <sha>] [--yes]
+python3 $CP report [--since <YYYY-MM-DD>] [--until <YYYY-MM-DD>] [--theme <tag>] [--json]
+python3 $CP ledger list [--theme <tag>]
 ```
 
 `list` flags are mutually exclusive in effect: `--closed` lists archived tasks (text); `--hook` emits SessionStart JSON for pending tasks. If both are passed, `--closed` wins and emits text — the SessionStart hook is configured with `--hook` only (see `install.py`), so this never triggers in practice.
@@ -76,6 +79,47 @@ python3 $CP link <id> <target-id> [--type blocks|depends-on|related]
 
 **Archiving vs memory:** Closing archives the *work record* (what was done, decisions, files) for traceability — it does NOT extract reusable technical knowledge. If the task produced a reusable conclusion (a debugging lesson, an operator finding, a cross-session engineering insight), sink it via the memory skill *before* `close --yes`. The archive is a log; memory is the knowledge base.
 
+## Distill & Report（证据台账）
+
+工作记忆层（`<id>.md`）与证据台账层（`ledger.jsonl`）分离。台账是跨任务、按
+`done_at`/`theme` 切片、证据锚定的述职素材台；`report` 消费台账，不消费工作记忆。
+
+**Promote a finished stream to the ledger:** 完成一个 stream 后，在 `.md` **末尾**
+（`## Key Files` 之后、所有 stream marker 之后）写一个 `## Evidence: <stream>` 块，
+再 `distill <id> <stream>` 晋升进台账：
+
+```
+## Evidence: initial
+- headline: 交付查询链路改造，P95 从 900ms 降到 210ms
+- change: 查询链路 A（N+1 子查询）→ B（批量 join）
+- decision: 否决缓存方案 C，因失效一致性成本过高
+- evidence: file:src/query.py@abc1234
+- evidence: command:pytest -q tests/query → 42 passed
+- theme: 性能优化
+- done_at: 2026-08-15
+```
+
+`distill <id> <stream>` 是 dry-run，`--yes` 才落盘；落盘后该块从 `.md` 删除。
+幂等：同 stream 重复 distill 只产生一条（覆盖）。close 之后仍可 distill（脚本会去
+`archived/` 找 .md）。
+
+**蒸馏契约（防流水账，distill 时必守）：**
+1. **三问替代"做了什么"**：必须回答 change（变了什么）/ decision（为什么、否决了什么）
+   / evidence（怎么证明做完），不是叙述过程。
+2. **headline 自检**：能否原样搬进述职、外人不看上下文也懂？不能则重写。
+3. **evidence 必须带 kind 且值非空**：只能是 `file:path@sha` / `command:cmd → 结果` /
+   `url:...`。脚本会硬拒绝裸字符串（如"改好了"）。
+4. **done_at 必填**：填**工作发生的本地日期**（`YYYY-MM-DD`），不是蒸馏当天——
+   `report` 按它切片，填错会导致周期报告错位。
+5. **相关性过滤**：只有"值得写进述职"的 stream 才 distill；琐碎维护只 archive-stream。
+6. **一个 stream 一个 headline**：多成果拆成多个 stream。
+7. **负例**：禁止"今天调了 A，又调了 B，最后 C 好了"；必须"交付了 X（evidence），
+   因为 Y（decision），否决了 Z"。
+
+**Read the evidence ledger:** `report` 生成证据清单（按 `done_at` 闭区间 / `--theme`
+分组 / `--json`）；`ledger list` 看原始条目。`report`/`ledger` 默认聚合所有 scope，
+加 `--scope-dir` 只看单目录（测试用）。
+
 ## Storage
 
 ```
@@ -86,6 +130,7 @@ python3 $CP link <id> <target-id> [--type blocks|depends-on|related]
 ~/.cc-switch/workflows/{global|projects/<slug>}/archive.jsonl    (closed tasks — script-owned, NEVER touch)
 ~/.cc-switch/workflows/{global|projects/<slug>}/archived/<id>.md  (closed-task recovery files)
 ~/.cc-switch/workflows/{global|projects/<slug>}/archived/<id>_history.md  (moved alongside on close)
+~/.cc-switch/workflows/{global|projects/<slug>}/ledger.jsonl  (evidence ledger — script-owned, NEVER touch)
 ```
 
 ## .md Template

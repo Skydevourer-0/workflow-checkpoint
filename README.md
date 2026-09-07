@@ -11,7 +11,8 @@ Claude Code 在 session 之间会丢失任务状态。下一个 session 不记�
 - SessionStart 自动提醒待办任务
 - 热度排序 — 任务搁置越久越显眼（>=7 天黄色，>=14 天红色）
 - 流级归档 — 完成的子流折叠出活跃 `.md` 进 `<id>_history.md`，长任务不膨胀
-- `checkpoint.py` — 5 个命令覆盖完整生命周期
+- 证据台账 — `distill` 把完成的 stream 蒸馏成结构化证据条目（`ledger.jsonl`），`report` 按日期/主题切片，服务述职/答辩/报告
+- `checkpoint.py` — 9 个命令覆盖完整生命周期 + 证据台账
 
 ## 安装
 
@@ -59,6 +60,16 @@ python3 ~/.cc-switch/skills/workflow-checkpoint/scripts/checkpoint.py archive-st
 python3 ~/.cc-switch/skills/workflow-checkpoint/scripts/checkpoint.py close <id>
 # 确认关闭（校验 .md → 归档 .md + <id>_history.md 到 archived/，记录移入 archive.jsonl）
 python3 ~/.cc-switch/skills/workflow-checkpoint/scripts/checkpoint.py close <id> --yes
+
+# 蒸馏：把 .md 末尾的 ## Evidence: <stream> 块晋升进 ledger（dry-run 预览）
+python3 ~/.cc-switch/skills/workflow-checkpoint/scripts/checkpoint.py distill <id> <stream>
+# 落盘（写入 ledger.jsonl + 从 .md 删除该块）
+python3 ~/.cc-switch/skills/workflow-checkpoint/scripts/checkpoint.py distill <id> <stream> --yes
+
+# 证据清单（按 done_at 闭区间 / 主题切片）
+python3 ~/.cc-switch/skills/workflow-checkpoint/scripts/checkpoint.py report --since 2026-08-01 --until 2026-08-31 --theme 性能优化
+# 原始台账
+python3 ~/.cc-switch/skills/workflow-checkpoint/scripts/checkpoint.py ledger list
 ```
 
 ### 流标记（archive-stream 用）
@@ -94,7 +105,8 @@ python3 ~/.cc-switch/skills/workflow-checkpoint/scripts/checkpoint.py close <id>
 ├── 20260629-100510-compare-skills.md   ← 模型编辑的恢复上下文
 ├── 20260629-100510-compare-skills_history.md  ← archive-stream 写的流摘要（懒创建）
 ├── archived/                           ← close 后的 .md / _history.md 移入此处
-└── archive.jsonl                       ← close 后的记录移入此处（status=closed）
+├── archive.jsonl                       ← close 后的记录移入此处（status=closed）
+└── ledger.jsonl                        ← 证据台账（distill 写入，脚本独占）
 ```
 
 - `workflows.jsonl` — 每行一条 JSON 记录，6 个字段：`id`、`title`、`created`、`updated`、`skill`、`source_docs`

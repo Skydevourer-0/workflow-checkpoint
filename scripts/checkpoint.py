@@ -18,9 +18,19 @@ import shutil
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
+
+try:
+    import fcntl
+except ImportError:  # Windows
+    fcntl = None
+try:
+    import msvcrt
+except ImportError:  # POSIX
+    msvcrt = None
 
 HOME = Path.home()
 
@@ -232,6 +242,116 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# ── .md read (CRLF normalization) ───────────────────────────────────────────
+
+def _read_md(path: Path) -> str:
+    """Read a recovery .md, normalizing CRLF -> LF for stable offsets.
+
+    Windows editors introduce CRLF; archive-stream's --range line offsets
+    (_line_start) and distill's Evidence-block removal both assume LF.
+    """
+    return path.read_text(encoding="utf-8").replace("\r\n", "\n")
+
+
+# ── Cross-process file lock ─────────────────────────────────────────────────
+
+def _lock_path(wf_dir: Path) -> Path:
+    """Path to the per-scope advisory lock file."""
+    return wf_dir / ".lock"
+
+
+@contextmanager
+def _with_lock(wf_dir: Path):
+    """Exclusive advisory lock around a read-modify-write critical section.
+
+    POSIX: fcntl.flock(LOCK_EX). Windows: msvcrt.locking on byte 0 of a file
+    opened 'a+b'. If neither is available, fail-open with a warning
+    (single-user local, best-effort). The lock file is never deleted.
+    """
+    wf_dir.mkdir(parents=True, exist_ok=True)
+    lp = _lock_path(wf_dir)
+    fh = open(lp, "a+b")
+    locked = False
+    try:
+        if fcntl is not None:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            locked = True
+        elif msvcrt is not None:
+            if os.path.getsize(lp) == 0:
+                fh.write(b"\0")
+                fh.flush()
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+            locked = True
+        else:
+            print("! warning: no file locking available; proceeding unlocked (best-effort)", file=sys.stderr)
+        yield
+    finally:
+        if locked:
+            try:
+                if fcntl is not None:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                elif msvcrt is not None:
+                    fh.seek(0)
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass
+        fh.close()
+
+
+# ── Ledger (evidence) I/O ───────────────────────────────────────────────────
+
+def _ledger_path(wf_dir: Path) -> Path:
+    """Path to the per-scope evidence ledger."""
+    return wf_dir / "ledger.jsonl"
+
+
+def _read_ledger_raw(wf_dir: Path) -> List[str]:
+    """Read ledger.jsonl lines verbatim (including malformed lines)."""
+    fp = _ledger_path(wf_dir)
+    if not fp.exists():
+        return []
+    return fp.read_text(encoding="utf-8").splitlines()
+
+
+def _read_ledger(wf_dir: Path) -> List[Dict]:
+    """Lenient parse of ledger.jsonl: skip + warn on malformed lines."""
+    records: List[Dict] = []
+    for line in _read_ledger_raw(wf_dir):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError as exc:
+            print(f"! warning: skipping malformed ledger line ({exc}): {line[:60]}...", file=sys.stderr)
+    return records
+
+
+def _write_ledger_lines(wf_dir: Path, lines: List[str]) -> None:
+    """Atomic write of raw ledger lines (tmp + replace)."""
+    wf_dir.mkdir(parents=True, exist_ok=True)
+    tmp = wf_dir / ".ledger.jsonl.tmp"
+    tmp.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    tmp.replace(_ledger_path(wf_dir))
+
+
+def _scope_from_dir(wf_dir: Path) -> str:
+    """Derive the scope string from a workflows dir path."""
+    if wf_dir.resolve() == (WORKFLOWS_ROOT / "global").resolve():
+        return "global"
+    return f"projects/{wf_dir.name}"
+
+
+def _all_ledger_dirs() -> List[Path]:
+    """All per-scope dirs to aggregate for report/ledger list."""
+    dirs = [WORKFLOWS_ROOT / "global"]
+    projects = WORKFLOWS_ROOT / "projects"
+    if projects.is_dir():
+        dirs.extend(sorted(p for p in projects.iterdir() if p.is_dir()))
+    return dirs
+
+
 # ── Recovery Template ───────────────────────────────────────────────────────
 
 _TEMPLATE = """<!-- Write ALL sections in English. -->
@@ -315,7 +435,10 @@ def _validate_markers(content: str, task_id: str) -> List[str]:
         if in_fence:
             continue
         if stripped.startswith("## "):
-            current_section = stripped
+            # `## Evidence: <stream>` blocks are transparent to marker
+            # section-tracking (they live at end-of-file; see spec §2.3).
+            if not stripped.startswith("## Evidence:"):
+                current_section = stripped
             continue
         m = MARKER_RE.search(line)
         if m:
@@ -424,7 +547,7 @@ def _validate_md(md_path: Path, task_id: Optional[str] = None) -> List[str]:
     if not md_path.exists():
         return [f"File not found: {md_path}"]
 
-    content = md_path.read_text(encoding="utf-8")
+    content = _read_md(md_path)
 
     # Marker assertions run on RAW content (before the comment strip below),
     # because markers are HTML comments and would be stripped away.
@@ -475,7 +598,7 @@ def _audit_md(md_path: Path) -> List[str]:
     """
     if not md_path.exists():
         return []
-    content = md_path.read_text(encoding="utf-8")
+    content = _read_md(md_path)
     content = re.sub(r"<!--.*?-->", "", content, flags=re.DOTALL)
 
     task_id = md_path.stem
@@ -856,6 +979,8 @@ def cmd_close(wf_dir: Path, args: Any) -> None:
             print(f"  {hist_path} -> {_archived_md_dir(wf_dir) / hist_path.name}")
         print(f"  workflows.jsonl line -> archive.jsonl (status=closed)")
         print("\n提醒: 如有可复用的技术知识请先通过 memory skill 沉淀。")
+        if md_exists and _has_evidence_blocks(md_path):
+            print(f"\n! 注意: .md 含未蒸馏的 ## Evidence 块 — close 后仍可 `distill {task_id} <stream> --yes` 补做。")
         print("\nRun `close <id> --yes` to archive (no deletion).")
         return
 
@@ -866,6 +991,13 @@ def cmd_close(wf_dir: Path, args: Any) -> None:
             print("Warning: .md validation issues:", file=sys.stderr)
             for e in errors:
                 print(f"  - {e}", file=sys.stderr)
+
+    # 1b. Warn loudly on undistilled Evidence blocks (non-blocking: distill
+    #     still works after close via archived/).
+    if md_exists and _has_evidence_blocks(md_path):
+        print("! WARNING: .md contains undistilled ## Evidence blocks — "
+              "distill after close via `distill <id> <stream> --yes`.",
+              file=sys.stderr)
 
     # 2. Move .md to archived/ subdirectory
     archived_dir = _archived_md_dir(wf_dir)
@@ -943,7 +1075,7 @@ def cmd_archive_stream(wf_dir: Path, args: Any) -> None:
         print(f"Recovery file not found: {md_path}", file=sys.stderr)
         sys.exit(1)
 
-    raw = md_path.read_text(encoding="utf-8")
+    raw = _read_md(md_path)
 
     # ── Resolve span source: named (marker pair) or --range (line range) ──────
     # Both paths produce (start_idx, end_after, body_lines, label) consumed by the
@@ -1108,6 +1240,10 @@ def cmd_archive_stream(wf_dir: Path, args: Any) -> None:
         if pointer_would_add:
             print(f"  add pointer to ## Completed: History: {task_id}_history.md")
         print(f"\nRun `archive-stream {task_id} {run_arg} --yes` to apply.")
+        evidence_blocks = _has_evidence_blocks(md_path)
+        if evidence_blocks:
+            print(f"\n! hint: 检测到未蒸馏的 ## Evidence 块: {', '.join(evidence_blocks)}")
+            print(f"  运行 `distill {task_id} <stream> --yes` 晋升到台账。")
         return
 
     # Apply.
@@ -1149,8 +1285,336 @@ def cmd_archive_stream(wf_dir: Path, args: Any) -> None:
     print(f"  updated: {now}")
 
 
+# ── Evidence ledger (distill / report / ledger) ─────────────────────────────
+
+EVIDENCE_LINE_RE = re.compile(r"^- (headline|change|decision|evidence|theme|done_at): (.*)$")
+EVIDENCE_HEADER_RE = re.compile(r"^## Evidence: ([a-z0-9-]+)[ \t]*$", re.MULTILINE)
+EVIDENCE_KIND_RE = re.compile(r"^(file|command|url):.+$")
+DONE_AT_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _parse_evidence_block(content: str, stream: str) -> Optional[Dict]:
+    """Parse the `## Evidence: <stream>` block into a dict, or None if absent.
+
+    The block is structurally bound to a stream name (header carries it), so a
+    block cannot be double-counted under a different stream.
+    """
+    target = None
+    for m in EVIDENCE_HEADER_RE.finditer(content):
+        if m.group(1) == stream:
+            target = m
+            break
+    if target is None:
+        return None
+    body = content[target.end():]
+    next_h = re.search(r"\n## ", body)
+    if next_h:
+        body = body[:next_h.start()]
+    entry: Dict[str, Any] = {"evidence": [], "themes": []}
+    for line in body.splitlines():
+        lm = EVIDENCE_LINE_RE.match(line)
+        if not lm:
+            continue
+        key, value = lm.group(1), lm.group(2).strip()
+        if key == "evidence":
+            entry["evidence"].append(value)
+        elif key == "theme":
+            entry["themes"].append(value)
+        elif key == "decision":
+            entry["decision"] = value
+        else:
+            entry[key] = value
+    return entry
+
+
+def _validate_evidence(entry: Dict) -> List[str]:
+    """Hard validation of a distilled evidence entry. Returns error list."""
+    errors: List[str] = []
+    headline = (entry.get("headline") or "").strip()
+    if not headline:
+        errors.append("headline is required and must be non-empty")
+    elif len(headline) > 140:
+        errors.append(f"headline must be <= 140 chars (got {len(headline)})")
+
+    change = (entry.get("change") or "").strip()
+    if not change:
+        errors.append("change is required and must be non-empty")
+
+    evidence = entry.get("evidence", [])
+    if not evidence:
+        errors.append("at least one evidence entry is required")
+    else:
+        for ev in evidence:
+            if not EVIDENCE_KIND_RE.match(ev):
+                errors.append(f"evidence must be 'file:|command:|url:' with a non-empty value: {ev!r}")
+
+    themes = entry.get("themes", [])
+    if not themes:
+        errors.append("at least one theme is required")
+
+    done_at = entry.get("done_at")
+    if not done_at or not DONE_AT_RE.match(done_at):
+        errors.append(f"done_at is required and must be YYYY-MM-DD (got {done_at!r})")
+
+    return errors
+
+
+def _find_md_for_distill(wf_dir: Path, task_id: str) -> Optional[Path]:
+    """Locate a task's .md for distill: pending first, then archived/."""
+    md = wf_dir / f"{task_id}.md"
+    if md.exists():
+        return md
+    archived = wf_dir / "archived" / f"{task_id}.md"
+    if archived.exists():
+        return archived
+    return None
+
+
+def _find_task_title(wf_dir: Path, task_id: str) -> Optional[str]:
+    """Read task title: pending (workflows.jsonl) then closed (archive.jsonl)."""
+    for r in _read_jsonl(wf_dir):
+        if r.get("id") == task_id:
+            return r.get("title")
+    for r in _read_archive(wf_dir):
+        if r.get("id") == task_id:
+            return r.get("title")
+    return None
+
+
+def _has_evidence_blocks(md_path: Path) -> List[str]:
+    """Return stream names of `## Evidence: <stream>` blocks in a .md."""
+    if not md_path.exists():
+        return []
+    return [m.group(1) for m in EVIDENCE_HEADER_RE.finditer(_read_md(md_path))]
+
+
+def _remove_evidence_block(content: str, stream: str) -> str:
+    """Remove a `## Evidence: <stream>` block (header + body) from .md content."""
+    lines = content.split("\n")
+    hdr_idx = None
+    for i, l in enumerate(lines):
+        if l.strip() == f"## Evidence: {stream}":
+            hdr_idx = i
+            break
+    if hdr_idx is None:
+        return content
+    end_idx = len(lines)
+    for i in range(hdr_idx + 1, len(lines)):
+        if lines[i].startswith("## "):
+            end_idx = i
+            break
+    return "\n".join(lines[:hdr_idx] + lines[end_idx:])
+
+
+def cmd_distill(wf_dir: Path, args: Any) -> None:
+    """Promote a stream's `## Evidence: <stream>` block into ledger.jsonl."""
+    task_id: str = args.id
+    stream: str = args.stream
+    if not re.fullmatch(r"[a-z0-9-]+", stream):
+        print(f"Invalid stream name '{stream}' (must match [a-z0-9-]+).", file=sys.stderr)
+        sys.exit(1)
+
+    scope = _scope_from_dir(wf_dir)
+    md_path = _find_md_for_distill(wf_dir, task_id)
+    if md_path is None:
+        print(f"Task '{task_id}' not found (pending or archived).", file=sys.stderr)
+        sys.exit(1)
+
+    raw = _read_md(md_path)
+    entry = _parse_evidence_block(raw, stream)
+    if entry is None:
+        existing = _has_evidence_blocks(md_path)
+        print(f"No '## Evidence: {stream}' block in {md_path}.", file=sys.stderr)
+        if existing:
+            print(f"  existing blocks: {', '.join(existing)}", file=sys.stderr)
+        else:
+            print("  no ## Evidence: blocks found", file=sys.stderr)
+        sys.exit(1)
+
+    errors = _validate_evidence(entry)
+    if errors:
+        print("Evidence validation failed:", file=sys.stderr)
+        for e in errors:
+            print(f"  - {e}", file=sys.stderr)
+        sys.exit(1)
+
+    new_entry = {
+        "id": f"{scope}:{task_id}:{stream}",
+        "task_id": task_id,
+        "task_title": _find_task_title(wf_dir, task_id),
+        "scope": scope,
+        "stream": stream,
+        "headline": entry["headline"].strip(),
+        "change": entry["change"].strip(),
+        "decision": entry.get("decision"),
+        "evidence": entry.get("evidence", []),
+        "themes": entry.get("themes", []),
+        "done_at": entry["done_at"],
+        "commit": _resolve_commit_hash(args),
+        "memory": None,
+        "ts": _now_iso(),
+    }
+
+    if not args.yes:
+        print(f"Task: {task_id}")
+        print(f"Stream: {stream}")
+        print(f"\nLedger entry (upsert by id {new_entry['id']}):")
+        print(json.dumps(new_entry, ensure_ascii=False, indent=2))
+        print(f"\nWill delete block '## Evidence: {stream}' from {md_path}")
+        print("\nRun `distill <id> <stream> --yes` to apply.")
+        return
+
+    # Upsert into ledger (line-preserving: malformed lines kept verbatim).
+    lines = _read_ledger_raw(wf_dir)
+    new_line = json.dumps(new_entry, ensure_ascii=False)
+    replaced = False
+    out: List[str] = []
+    for line in lines:
+        if not line.strip():
+            out.append(line)
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            out.append(line)  # keep malformed line verbatim
+            continue
+        if parsed.get("id") == new_entry["id"]:
+            out.append(new_line)
+            replaced = True
+        else:
+            out.append(line)
+    if not replaced:
+        out.append(new_line)
+    _write_ledger_lines(wf_dir, out)
+
+    # Consume the Evidence block from the .md.
+    md_path.write_text(_remove_evidence_block(raw, stream), encoding="utf-8")
+
+    print(f"Distilled '{stream}' from {task_id} -> {_ledger_path(wf_dir).name}")
+    print(f"  {new_entry['headline']}")
+
+
+def _load_all_ledger_entries() -> List[Dict]:
+    entries: List[Dict] = []
+    for d in _all_ledger_dirs():
+        entries.extend(_read_ledger(d))
+    return entries
+
+
+def _ledger_entries_for(args: Any, wf_dir: Path) -> List[Dict]:
+    """Ledger entries for report/ledger: single scope if --scope-dir is given
+    (testing), else aggregate across all scopes."""
+    if getattr(args, "scope_dir", None):
+        return _read_ledger(wf_dir)
+    return _load_all_ledger_entries()
+
+
+def _print_ledger_entry(e: Dict) -> None:
+    print(f"- {e.get('headline', '')}  [{e.get('done_at', '')}]")
+    if e.get("change"):
+        print(f"    change: {e.get('change')}")
+    if e.get("decision"):
+        print(f"    decision: {e.get('decision')}")
+    for ev in e.get("evidence", []):
+        print(f"    evidence: {ev}")
+    print(f"    ref: {e.get('scope', '')} · {e.get('task_id', '')} · {e.get('stream', '')}")
+    print()
+
+
+def cmd_report(wf_dir: Path, args: Any) -> None:
+    entries = _ledger_entries_for(args, wf_dir)
+    since = getattr(args, "since", None)
+    until = getattr(args, "until", None)
+    themes = getattr(args, "theme", None) or []
+
+    filtered = []
+    for e in entries:
+        done = e.get("done_at", "")
+        if since and done < since:
+            continue
+        if until and done > until:
+            continue
+        if themes:
+            if not set(e.get("themes", [])).intersection(themes):
+                continue
+        filtered.append(e)
+
+    filtered.sort(key=lambda e: (e.get("done_at", ""), e.get("ts", "")))
+
+    if getattr(args, "json", False):
+        # JSON is the machine-consumption path: force UTF-8 stdout (Windows
+        # otherwise emits the locale codepage and garbles CJK for consumers).
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError, OSError):
+            pass
+        print(json.dumps(filtered, ensure_ascii=False, indent=2))
+        return
+
+    if not filtered:
+        print("No ledger entries.")
+        return
+
+    if themes:
+        groups: Dict[str, List[Dict]] = {}
+        for e in filtered:
+            et = set(e.get("themes", []))
+            matched = [t for t in themes if t in et]
+            key = matched[0] if matched else (sorted(et)[0] if et else "(none)")
+            groups.setdefault(key, []).append(e)
+        for theme in sorted(groups):
+            print(f"## {theme}")
+            for e in groups[theme]:
+                _print_ledger_entry(e)
+    else:
+        for e in filtered:
+            _print_ledger_entry(e)
+
+
+def cmd_ledger_list(wf_dir: Path, args: Any) -> None:
+    entries = _ledger_entries_for(args, wf_dir)
+    themes = getattr(args, "theme", None) or []
+    if themes:
+        entries = [e for e in entries if set(e.get("themes", [])).intersection(themes)]
+    entries.sort(key=lambda e: e.get("ts", ""))
+    if not entries:
+        print("No ledger entries.")
+        return
+    print(f"Ledger entries ({len(entries)})")
+    for e in entries:
+        print(f"  {e.get('id', '?')} — {e.get('done_at', '')} — {e.get('headline', '')}")
+
 
 # ── CLI ─────────────────────────────────────────────────────────────────────
+
+WRITE_COMMANDS = ("create", "pause", "close", "archive-stream", "link", "distill")
+
+
+def _dispatch(command: str, wf_dir: Path, args: Any) -> None:
+    if command == "list":
+        cmd_list(wf_dir, args)
+    elif command == "create":
+        cmd_create(wf_dir, args)
+    elif command == "pause":
+        cmd_pause(wf_dir, args)
+    elif command == "close":
+        cmd_close(wf_dir, args)
+    elif command == "archive-stream":
+        cmd_archive_stream(wf_dir, args)
+    elif command == "link":
+        cmd_link(wf_dir, args)
+    elif command == "distill":
+        cmd_distill(wf_dir, args)
+    elif command == "report":
+        cmd_report(wf_dir, args)
+    elif command == "ledger":
+        if getattr(args, "ledger_command", None) == "list":
+            cmd_ledger_list(wf_dir, args)
+        else:
+            print("Usage: checkpoint.py ledger list [--theme T]", file=sys.stderr)
+    else:
+        print(f"Unknown command: {command}", file=sys.stderr)
+
 
 def main() -> None:
     import argparse
@@ -1191,6 +1655,23 @@ def main() -> None:
     sp.add_argument("target", type=str, help="Target task id")
     sp.add_argument("--type", type=str, default="related", choices=list(VALID_RELATION_TYPES), help="Relation type")
 
+    sp = sub.add_parser("distill", help="Promote a stream's Evidence block into the ledger")
+    sp.add_argument("id", type=str, help="Task id (yyyyMMdd-HHmmss-slug)")
+    sp.add_argument("stream", type=str, help="Stream name (matches '## Evidence: <stream>')")
+    sp.add_argument("--commit", type=str, help="Commit hash (default: best-effort git HEAD)")
+    sp.add_argument("--yes", action="store_true", help="Apply (default is dry-run)")
+
+    sp = sub.add_parser("report", help="Generate an evidence report from the ledger")
+    sp.add_argument("--since", type=str, help="Start date YYYY-MM-DD (inclusive)")
+    sp.add_argument("--until", type=str, help="End date YYYY-MM-DD (inclusive)")
+    sp.add_argument("--theme", action="append", help="Filter/group by theme (repeatable)")
+    sp.add_argument("--json", action="store_true", help="Output JSON")
+
+    sp = sub.add_parser("ledger", help="Raw evidence-ledger view")
+    lsub = sp.add_subparsers(dest="ledger_command")
+    lsp = lsub.add_parser("list", help="List ledger entries")
+    lsp.add_argument("--theme", action="append", help="Filter by theme (repeatable)")
+
     args = p.parse_args()
     if not args.command:
         p.print_help()
@@ -1212,17 +1693,12 @@ def main() -> None:
             return
         return
 
-    if args.command == "list":
-        cmd_list(wf_dir, args)
-    elif args.command == "create":
-        cmd_create(wf_dir, args)
-    elif args.command == "pause":
-        cmd_pause(wf_dir, args)
-    elif args.command == "close":
-        cmd_close(wf_dir, args)
-    elif args.command == "archive-stream":
-        cmd_archive_stream(wf_dir, args)
-    elif args.command == "link":
-        cmd_link(wf_dir, args)
+    if args.command in WRITE_COMMANDS:
+        with _with_lock(wf_dir):
+            _dispatch(args.command, wf_dir, args)
+        return
+    _dispatch(args.command, wf_dir, args)
+
+
 if __name__ == "__main__":
     main()

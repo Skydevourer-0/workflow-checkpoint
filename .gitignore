@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 *.pyo
+
+# Design docs (specs, writing-plans) — kept local only, not committed
+docs/

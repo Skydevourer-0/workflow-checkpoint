@@ -1402,4 +1402,151 @@ class TestCliClose:
             assert doc.exists(), "source doc should be kept after close"
 
 
+# ── Evidence ledger (distill / report / ledger) ──────────────────────────────
+
+VALID_EVIDENCE_BLOCK = (
+    "## Evidence: initial\n"
+    "- headline: deliver evidence ledger feature\n"
+    "- change: no ledger -> has ledger.jsonl\n"
+    "- decision: reject manual ledger writes\n"
+    "- evidence: file:scripts/checkpoint.py@abc1234\n"
+    "- evidence: command:pytest -q -> 1 passed\n"
+    "- theme: smoke\n"
+    "- done_at: 2026-08-15\n"
+)
+
+
+def _make_evidence_task(scope_dir, title="evidence-task", block=None):
+    """Create a task, optionally append an Evidence block, return (task_id, md_path)."""
+    r = _run("create", title, "--note", "test", scope_dir=scope_dir)
+    assert r.returncode == 0, r.stderr
+    m = re.search(r"^Created (\S+)", r.stdout, re.MULTILINE)
+    assert m, f"create did not print task id: {r.stdout}"
+    task_id = m.group(1)
+    md_path = Path(scope_dir) / f"{task_id}.md"
+    if block is not None:
+        md_path.write_text(md_path.read_text(encoding="utf-8") + "\n" + block, encoding="utf-8")
+    return task_id, md_path
+
+
+def _ledger_entries(scope_dir):
+    fp = Path(scope_dir) / "ledger.jsonl"
+    if not fp.exists():
+        return []
+    return [json.loads(l) for l in fp.read_text(encoding="utf-8").splitlines() if l.strip()]
+
+
+class TestEvidenceLedger:
+    def test_distill_valid_and_consumes_block(self, tmp_path):
+        task_id, md_path = _make_evidence_task(str(tmp_path), block=VALID_EVIDENCE_BLOCK)
+        r = _run("distill", task_id, "initial", "--yes", scope_dir=tmp_path)
+        assert r.returncode == 0, r.stderr
+        entries = _ledger_entries(tmp_path)
+        assert len(entries) == 1
+        e = entries[0]
+        assert e["headline"] == "deliver evidence ledger feature"
+        assert e["evidence"][0] == "file:scripts/checkpoint.py@abc1234"
+        assert e["themes"] == ["smoke"]
+        assert e["done_at"] == "2026-08-15"
+        assert e["scope"].startswith("projects/")
+        assert "## Evidence: initial" not in md_path.read_text(encoding="utf-8")
+
+    def test_distill_missing_evidence_fails(self, tmp_path):
+        block = (
+            "## Evidence: initial\n- headline: x\n- change: y\n"
+            "- theme: t\n- done_at: 2026-08-15\n"
+        )
+        task_id, _ = _make_evidence_task(str(tmp_path), block=block)
+        r = _run("distill", task_id, "initial", "--yes", scope_dir=tmp_path)
+        assert r.returncode != 0
+        assert "evidence" in r.stderr
+        assert _ledger_entries(tmp_path) == []
+
+    def test_distill_bare_evidence_fails(self, tmp_path):
+        block = (
+            "## Evidence: initial\n- headline: x\n- change: y\n"
+            "- evidence: done it\n- theme: t\n- done_at: 2026-08-15\n"
+        )
+        task_id, _ = _make_evidence_task(str(tmp_path), block=block)
+        r = _run("distill", task_id, "initial", "--yes", scope_dir=tmp_path)
+        assert r.returncode != 0
+        assert "evidence" in r.stderr
+
+    def test_distill_missing_done_at_fails(self, tmp_path):
+        block = (
+            "## Evidence: initial\n- headline: x\n- change: y\n"
+            "- evidence: file:a@1\n- theme: t\n"
+        )
+        task_id, _ = _make_evidence_task(str(tmp_path), block=block)
+        r = _run("distill", task_id, "initial", "--yes", scope_dir=tmp_path)
+        assert r.returncode != 0
+        assert "done_at" in r.stderr
+
+    def test_distill_idempotent(self, tmp_path):
+        task_id, md_path = _make_evidence_task(str(tmp_path), block=VALID_EVIDENCE_BLOCK)
+        assert _run("distill", task_id, "initial", "--yes", scope_dir=tmp_path).returncode == 0
+        # re-add the (consumed) block and distill again -> still exactly one entry
+        md_path.write_text(md_path.read_text(encoding="utf-8") + "\n" + VALID_EVIDENCE_BLOCK, encoding="utf-8")
+        assert _run("distill", task_id, "initial", "--yes", scope_dir=tmp_path).returncode == 0
+        assert len(_ledger_entries(tmp_path)) == 1
+
+    def test_report_done_at_slicing(self, tmp_path):
+        task_id_a, _ = _make_evidence_task(str(tmp_path), block=VALID_EVIDENCE_BLOCK.replace("2026-08-15", "2026-07-01"))
+        assert _run("distill", task_id_a, "initial", "--yes", scope_dir=tmp_path).returncode == 0
+        task_id_b, _ = _make_evidence_task(str(tmp_path), title="evidence-task-b",
+                                           block=VALID_EVIDENCE_BLOCK.replace("2026-08-15", "2026-09-01"))
+        assert _run("distill", task_id_b, "initial", "--yes", scope_dir=tmp_path).returncode == 0
+
+        r_aug = _run("report", "--since", "2026-08-01", "--until", "2026-08-31", "--json", scope_dir=tmp_path)
+        assert r_aug.returncode == 0
+        assert json.loads(r_aug.stdout) == []
+
+        r_jul = _run("report", "--since", "2026-07-01", "--until", "2026-07-31", "--json", scope_dir=tmp_path)
+        assert json.loads(r_jul.stdout)[0]["done_at"] == "2026-07-01"
+
+    def test_report_theme_filter(self, tmp_path):
+        task_id, _ = _make_evidence_task(str(tmp_path), block=VALID_EVIDENCE_BLOCK)
+        assert _run("distill", task_id, "initial", "--yes", scope_dir=tmp_path).returncode == 0
+        r = _run("report", "--theme", "smoke", "--json", scope_dir=tmp_path)
+        assert len(json.loads(r.stdout)) == 1
+        r_none = _run("report", "--theme", "nope", "--json", scope_dir=tmp_path)
+        assert json.loads(r_none.stdout) == []
+
+    def test_ledger_bad_line_tolerant(self, tmp_path):
+        task_id, _ = _make_evidence_task(str(tmp_path), block=VALID_EVIDENCE_BLOCK)
+        assert _run("distill", task_id, "initial", "--yes", scope_dir=tmp_path).returncode == 0
+        ledger = Path(tmp_path) / "ledger.jsonl"
+        ledger.write_text("NOT VALID JSON\n" + ledger.read_text(encoding="utf-8"), encoding="utf-8")
+        r = _run("report", "--json", scope_dir=tmp_path)
+        assert r.returncode == 0
+        assert len(json.loads(r.stdout)) == 1
+
+    def test_distill_headline_too_long(self, tmp_path):
+        block = VALID_EVIDENCE_BLOCK.replace(
+            "- headline: deliver evidence ledger feature",
+            "- headline: " + "x" * 141)
+        task_id, _ = _make_evidence_task(str(tmp_path), block=block)
+        r = _run("distill", task_id, "initial", "--yes", scope_dir=tmp_path)
+        assert r.returncode != 0
+        assert "140" in r.stderr
+
+    def test_distill_after_close(self, tmp_path):
+        task_id, _ = _make_evidence_task(str(tmp_path), block=VALID_EVIDENCE_BLOCK)
+        assert _run("close", task_id, "--yes", scope_dir=tmp_path).returncode == 0
+        r = _run("distill", task_id, "initial", "--yes", scope_dir=tmp_path)
+        assert r.returncode == 0, r.stderr
+        entries = _ledger_entries(tmp_path)
+        assert len(entries) == 1
+        assert entries[0]["task_title"] == "evidence-task"
+
+    def test_crlf_normalized(self, tmp_path):
+        task_id, md_path = _make_evidence_task(str(tmp_path), block=None)
+        content = md_path.read_text(encoding="utf-8").replace("\n", "\r\n")
+        content += "\r\n" + VALID_EVIDENCE_BLOCK.replace("\n", "\r\n")
+        md_path.write_bytes(content.encode("utf-8"))
+        r = _run("distill", task_id, "initial", "--yes", scope_dir=tmp_path)
+        assert r.returncode == 0, r.stderr
+        assert len(_ledger_entries(tmp_path)) == 1
+
+
 
