@@ -1,7 +1,7 @@
 {
   "name": "workflow-checkpoint-dsh",
-  "description": "DSH native hook: inject pending workflow-checkpoint tasks at session start via the agent/session-start extension point (reuses checkpoint.py list --hook).",
-  "version": "0.1.0",
+  "description": "DSH native plugin: inject pending workflow-checkpoint tasks at session start (agent/session-start hook) and expose the evidence ledger as tools (checkpoint_report / checkpoint_ledger). Reuses checkpoint.py.",
+  "version": "0.2.0",
   "type": "module",
   "main": "lib/index.js",
   "license": "MIT",
